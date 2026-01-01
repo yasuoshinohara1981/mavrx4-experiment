@@ -1,8 +1,8 @@
 {
-  "name": "threejs-mavrx4",
+  "name": "threejs-mavrx4-experiment",
   "version": "1.0.0",
   "type": "module",
-  "description": "Three.js GPU Particle System with OSC for Live Visual",
+  "description": "Three.js MAVRX4 Experiment - flow-masterベースのWebGPU実装 + HUD/OSC統合",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -10,11 +10,21 @@
     "osc-server": "node osc-server.js"
   },
   "dependencies": {
+    "@tweakpane/plugin-essentials": "^0.2.1",
+    "tweakpane-plugin-infodump": "^4.0.2",
+    "is-mobile": "^5.0.0",
     "osc-js": "^2.4.0",
-    "three": "^0.160.0",
+    "three": "^0.176.0",
+    "tweakpane": "^4.0.5",
     "ws": "^8.18.3"
   },
   "devDependencies": {
-    "vite": "^5.0.0"
+    "@babel/generator": "^7.26.9",
+    "@babel/parser": "^7.26.9",
+    "@babel/traverse": "^7.26.9",
+    "@babel/types": "^7.26.9",
+    "vite": "^6.3.1",
+    "vite-plugin-plain-text": "^1.4.2",
+    "vite-plugin-tsl-operator": "^1.2.3"
   }
 }

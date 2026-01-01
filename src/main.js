@@ -1,9 +1,9 @@
 /**
- * Three.js MAVRX4 Live Visual
- * メインエントリーポイント
+ * Three.js MAVRX4 Experiment
+ * WebGPU専用システム（Scene01 = MLS-MPM）+ HUD/OSC統合
  */
 
-import * as THREE from 'three';
+import * as THREE from "three/webgpu";
 import { OSCManager } from './systems/OSCManager.js';
 import { SceneManager } from './systems/SceneManager.js';
 
@@ -14,48 +14,64 @@ import { SceneManager } from './systems/SceneManager.js';
 let renderer, camera, scene;
 let sceneManager;
 let oscManager;
-
-// アニメーションループ用
-let time = 0;
-let lastTime = performance.now();
 let frameCount = 0;
-
-// キー入力管理
+let lastTime = performance.now();
+// NOTE:
+// ctrlPressed は keyup が取りこぼされると「押しっぱ」扱いになって
+// 以降のキー入力が全部 Ctrl モードとして処理されてしまうことがある（特にMac/Meta）。
+// ここでは e.ctrlKey/e.metaKey を信頼して扱う。
 let ctrlPressed = false;
+// Ctrl+数字でシーン切替した直後に、数字keyupが「トグル」として誤爆するのを防ぐ
+let suppressDigitToggleUntilMs = 0;
 
 // ============================================
 // レンダラーの初期化
 // ============================================
 
-function initRenderer() {
-    renderer = new THREE.WebGLRenderer({ 
-        antialias: true,
-        powerPreference: 'high-performance'
+const createRenderer = () => {
+    if (!navigator.gpu) {
+        error("Your device does not support WebGPU.");
+        return null;
+    }
+
+    const renderer = new THREE.WebGPURenderer({
+        //forceWebGL: true,
+        //antialias: true,
     });
-    renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setClearColor(0x000000);
-    document.body.appendChild(renderer.domElement);
-    
-    // マウスカーソルを常に非表示にする
-    document.body.style.cursor = 'none';
-    renderer.domElement.style.cursor = 'none';
-}
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    return renderer;
+};
+
+const error = (msg) => {
+    console.error(msg);
+    const errorDiv = document.createElement('div');
+    errorDiv.style.position = 'absolute';
+    errorDiv.style.left = '50%';
+    errorDiv.style.top = '50%';
+    errorDiv.style.transform = 'translate(-50%, -50%)';
+    errorDiv.style.color = '#FFFFFF';
+    errorDiv.style.fontSize = '24px';
+    errorDiv.style.zIndex = '10000';
+    errorDiv.textContent = "Error: " + msg;
+    document.body.appendChild(errorDiv);
+};
 
 // ============================================
 // カメラの初期化
 // ============================================
 
 function initCamera() {
-    // Processing版のデフォルトFOVは60度
-    // Three.jsのFOVを60度に変更（75度 → 60度）
     camera = new THREE.PerspectiveCamera(
-        60,  // FOVを60度に変更（Processing版と同じ）
+        60,
         window.innerWidth / window.innerHeight,
-        0.1,
-        10000
+        0.01,
+        5
     );
-    camera.position.z = 1000;
+    // Scene01(MLS-MPM)のスケールに合わせた初期位置（far=5の範囲内）
+    camera.position.set(0, 0.5, -1.0);
+    camera.lookAt(0, 0.5, 0.0);
 }
 
 // ============================================
@@ -64,16 +80,14 @@ function initCamera() {
 
 function initOSC() {
     oscManager = new OSCManager({
-        wsUrl: 'ws://localhost:8080',  // WebSocketサーバーのURL
+        wsUrl: 'ws://localhost:8080',
         onMessage: (message) => {
-            // シーンマネージャーにOSCメッセージを転送
             if (sceneManager) {
                 sceneManager.handleOSC(message);
             }
         },
         onStatusChange: (status) => {
             document.getElementById('oscStatus').textContent = status;
-            // 現在のシーンにOSC状態を設定
             if (sceneManager) {
                 const currentScene = sceneManager.getCurrentScene();
                 if (currentScene) {
@@ -89,17 +103,42 @@ function initOSC() {
 // ============================================
 
 function initSceneManager() {
-    sceneManager = new SceneManager(renderer, camera);
+    sceneManager = new SceneManager(renderer, camera, null);
     
-    // シーン切り替え時のコールバック
     sceneManager.onSceneChange = (sceneName) => {
         document.getElementById('sceneName').textContent = sceneName;
     };
+    
+    // プリロード進捗表示（オプション）
+    sceneManager.onPreloadProgress = (current, total, sceneName) => {
+        console.log(`プリロード進捗: ${current}/${total} - ${sceneName}`);
+        // 必要に応じてUIに表示
+        // const progressEl = document.getElementById('preload-progress');
+        // if (progressEl) {
+        //     progressEl.textContent = `プリロード中: ${current}/${total} - ${sceneName}`;
+        // }
+    };
 }
+
 
 // ============================================
 // アニメーションループ
 // ============================================
+
+const updateLoadingProgressBar = async (frac, delay = 0) => {
+    return new Promise(resolve => {
+        // プログレスバーがあれば更新（index.htmlのHTML要素）
+        const progress = document.getElementById("progress");
+        if (progress) {
+            progress.style.width = `${frac * 200}px`;
+        }
+        if (delay === 0) {
+            resolve();
+        } else {
+            setTimeout(resolve, delay);
+        }
+    });
+};
 
 function animate() {
     requestAnimationFrame(animate);
@@ -107,10 +146,9 @@ function animate() {
     const now = performance.now();
     const deltaTime = (now - lastTime) / 1000.0;
     lastTime = now;
-    time += deltaTime;
+    frameCount++;
 
     // FPS計算
-    frameCount++;
     if (frameCount % 60 === 0) {
         const fps = Math.round(1.0 / deltaTime);
         document.getElementById('fps').textContent = fps;
@@ -128,26 +166,15 @@ function animate() {
 // ============================================
 
 function onWindowResize() {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    
+    if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+    }
+    if (renderer) {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
     if (sceneManager) {
         sceneManager.onResize();
-    }
-}
-
-// ============================================
-// フルスクリーン処理
-// ============================================
-
-function toggleFullscreen() {
-    if (!document.fullscreenElement) {
-        document.documentElement.requestFullscreen().catch(err => {
-            console.log('フルスクリーンエラー:', err);
-        });
-    } else {
-        document.exitFullscreen();
     }
 }
 
@@ -155,67 +182,112 @@ function toggleFullscreen() {
 // キーボード入力処理
 // ============================================
 
-/**
- * キーが押された時の処理（キーダウン）
- */
-function handleKeyDown(e) {
-    // Ctrlキーの状態を確認（e.ctrlKey/e.metaKeyを直接確認してより確実に）
+async function handleKeyDown(e) {
+    // Ctrlキーの状態を確認
     if (e.key === 'Control' || e.key === 'Meta') {
         ctrlPressed = true;
         return;
     }
     
-    // e.ctrlKey/e.metaKeyを直接確認（より確実な検出）
     const isCtrlPressed = e.ctrlKey || e.metaKey;
+    // keyup取りこぼし対策：実際の修飾キー状態で同期
+    ctrlPressed = isCtrlPressed;
     
     if (!sceneManager) return;
     
     const currentScene = sceneManager.getCurrentScene();
     if (!currentScene) return;
     
-    // Ctrl + 数字キーでシーン切り替え（ctrlPressedまたはisCtrlPressedのどちらかがtrueの場合）
-    if (ctrlPressed || isCtrlPressed) {
+    // Ctrl + 数字キーでシーン切り替え
+    if (isCtrlPressed) {
         const num = parseInt(e.key);
         if (num >= 1 && num <= 9) {
             e.preventDefault();
-            // Ctrl+6でScene06に切り替え（Scene06はインデックス5）
-            if (num === 6) {
-                sceneManager.switchScene(5);
-            } else if (num === 7) {
-                // Ctrl+7でScene07に切り替え（Scene07はインデックス6）
-                sceneManager.switchScene(6);
-            } else if (num === 8) {
-                // Ctrl+8でScene08に切り替え（Scene08はインデックス7）
-                sceneManager.switchScene(7);
-            } else if (num === 9) {
-                // Ctrl+9でScene09に切り替え（Scene09はインデックス8）
-                sceneManager.switchScene(8);
-            } else {
-                sceneManager.switchScene(num - 1);
+            // keyupの離し順（Ctrl先に離す等）でトグルが走らないようにする
+            suppressDigitToggleUntilMs = performance.now() + 300;
+            // WebGPU専用構成
+            // switchSceneをawaitで待つ（プリロード完了まで待機）
+            try {
+                if (num === 1) {
+                    await sceneManager.switchScene(0); // Scene01（デフォルト）
+                } else if (num === 2) {
+                    await sceneManager.switchScene(1); // Scene02
+                } else if (num === 3) {
+                    await sceneManager.switchScene(2); // Scene03
+                } else if (num === 4) {
+                    await sceneManager.switchScene(3); // Scene04
+                } else {
+                    // シーン4以降は今後追加
+                    console.log(`シーン${num}はまだ実装されていません`);
+                }
+            } catch (err) {
+                console.error('シーン切り替えエラー:', err);
             }
             return;
         } else if (e.key === '0') {
             e.preventDefault();
-            sceneManager.switchScene(9);  // '0' → Scene10
+            // '0'は未使用（将来の拡張用）
             return;
         }
-        // Ctrl押下中は他の処理をスキップ（数字キーがエフェクトとして処理されないように）
+        // Ctrl押下中は他の処理をスキップ
         return;
     }
     
-    // h/HキーでHUDのオンオフ（グローバル状態を更新）
+    // h/HキーでHUDのオンオフ
     if (e.key === 'h' || e.key === 'H') {
         e.preventDefault();
-        // グローバル状態を更新
-        if (sceneManager) {
-            sceneManager.globalShowHUD = !sceneManager.globalShowHUD;
-            // 現在のシーンにも適用
+        sceneManager.globalShowHUD = !sceneManager.globalShowHUD;
+        if (currentScene) {
             currentScene.showHUD = sceneManager.globalShowHUD;
-            console.log('HUD:', sceneManager.globalShowHUD ? 'ON' : 'OFF');
-        } else {
-            // フォールバック（sceneManagerがない場合）
-            currentScene.showHUD = !currentScene.showHUD;
-            console.log('HUD:', currentScene.showHUD ? 'ON' : 'OFF');
+            if (currentScene.hud) {
+                currentScene.hud.showHUD = sceneManager.globalShowHUD;
+                if (!sceneManager.globalShowHUD && currentScene.hud.clear) {
+                    currentScene.hud.clear();
+                }
+            }
+        }
+        return;
+    }
+
+    // 数字キーはkeyupでトグルする（keydown/keyup両方でトグルすると2回反転してしまう）
+    const num = parseInt(e.key);
+    if (!isNaN(num) && num >= 1 && num <= 9) {
+        e.preventDefault();
+        return;
+    }
+
+    // c/C: カメラデバッグ表示ON/OFF / カメラ切り替え
+    if (e.key === 'c' || e.key === 'C') {
+        e.preventDefault();
+        if (currentScene.handleKeyPress) {
+            currentScene.handleKeyPress(e.key);
+        }
+        return;
+    }
+
+    // g/G: HUDグリッド（床+縦グリッド+ルーラー）ON/OFF
+    if (e.key === 'g' || e.key === 'G') {
+        e.preventDefault();
+        if (currentScene.handleKeyPress) {
+            currentScene.handleKeyPress(e.key);
+        }
+        return;
+    }
+
+    // p/P: パーティクル表示ON/OFF（床のズレ確認用）
+    if (e.key === 'p' || e.key === 'P') {
+        e.preventDefault();
+        if (currentScene.handleKeyPress) {
+            currentScene.handleKeyPress(e.key);
+        }
+        return;
+    }
+
+    // f/F: fill（塗り）表示ON/OFF（Scene側で扱う）
+    if (e.key === 'f' || e.key === 'F') {
+        e.preventDefault();
+        if (currentScene.handleKeyPress) {
+            currentScene.handleKeyPress(e.key);
         }
         return;
     }
@@ -237,50 +309,14 @@ function handleKeyDown(e) {
         }
         return;
     }
-    
-    // 数字キー1〜9でエフェクトのオン/オフをトグル（Ctrlが押されていない時のみ）
-    const num = parseInt(e.key);
-    if (!isNaN(num) && num >= 1 && num <= 9) {
-        e.preventDefault();
-        // エフェクトのオン/オフを切り替え
-        if (currentScene.toggleEffect) {
-            currentScene.toggleEffect(num);
-        }
-        return;
-    }
-    
-    // 数字キー0はそのままOSCメッセージとして処理（10として扱う）
-    if (e.key === '0') {
-        e.preventDefault();
-        const message = {
-            trackNumber: 10,
-            args: [],
-            address: `/track/10`
-        };
-        currentScene.handleTrackNumber(10, message);
-        return;
-    }
-    
-    // r/Rキーでリセット
-    if (e.key === 'r' || e.key === 'R') {
-        e.preventDefault();
-        if (currentScene.reset) {
-            currentScene.reset();
-            console.log('Scene reset');
-        }
-        return;
-    }
-    
-    // F11: フルスクリーン
-    if (e.key === 'F11') {
-        e.preventDefault();
-        toggleFullscreen();
+
+    // その他のキーは currentScene に転送（Scene側で自由に拡張できるようにする）
+    // NOTE: ここが無いと u/m などが一切届かない
+    if (currentScene.handleKeyPress) {
+        currentScene.handleKeyPress(e.key);
     }
 }
 
-/**
- * キーが離された時の処理（キーアップ）
- */
 function handleKeyUp(e) {
     // Ctrlキーの状態をリセット
     if (e.key === 'Control' || e.key === 'Meta') {
@@ -288,7 +324,6 @@ function handleKeyUp(e) {
         return;
     }
     
-    // e.ctrlKey/e.metaKeyがfalseになったら、ctrlPressedもリセット
     if (!e.ctrlKey && !e.metaKey) {
         ctrlPressed = false;
     }
@@ -297,109 +332,86 @@ function handleKeyUp(e) {
     
     const currentScene = sceneManager.getCurrentScene();
     if (!currentScene) return;
-    
-    // 数字キー0〜9の処理
-    const num = parseInt(e.key);
-    if (!isNaN(num) && num >= 0 && num <= 9) {
-        let trackNumber = num;
-        if (trackNumber === 0) {
-            trackNumber = 10;  // '0' → 10
-        }
-        
-        // トラック2、3、4、5はキーが離された時にエフェクトを無効化
-        if (trackNumber === 2 || trackNumber === 3 || trackNumber === 4 || trackNumber === 5) {
-            e.preventDefault();
-            if (currentScene && currentScene.handleKeyUp) {
-                currentScene.handleKeyUp(trackNumber);
-            } else {
-                console.warn('Scene does not have handleKeyUp method');
-            }
-            return;
-        }
-    }
-    
-    // その他のキーアップ処理
-    if (e.key === 'l' || e.key === 'L') {
-        // Lキーで線描画の切り替え
-        currentScene.SHOW_LINES = !currentScene.SHOW_LINES;
-        console.log('SHOW_LINES:', currentScene.SHOW_LINES);
-    }
-    
-    if (e.key === 'p' || e.key === 'P') {
-        // Pキーでパーティクル表示の切り替え
-        currentScene.SHOW_PARTICLES = !currentScene.SHOW_PARTICLES;
-        console.log('SHOW_PARTICLES:', currentScene.SHOW_PARTICLES);
-    }
-    
-    // c/Cキーでカメラデバッグ表示の切り替え（Scene04専用）
-    if (e.key === 'c' || e.key === 'C') {
+
+    // r/R: リセット
+    if (e.key === 'r' || e.key === 'R') {
         e.preventDefault();
-        if (currentScene.handleKeyPress) {
-            currentScene.handleKeyPress(e.key);
+        if (currentScene.reset) {
+            currentScene.reset();
         }
+        return;
+    }
+    
+    // 数字キー1〜9はキーアップでトグル（スイッチ式）
+    // NOTE: Ctrl+数字は「シーン切替」なので、ここでトグルしない（誤ってOFFになる問題の対策）
+    // - 離し順（Ctrl→数字）でも誤爆しないように、シーン切替直後は一定時間スキップする
+    if (e.ctrlKey || e.metaKey || ctrlPressed) return;
+    if (performance.now() < suppressDigitToggleUntilMs) return;
+    const num = parseInt(e.key);
+    if (!isNaN(num) && num >= 1 && num <= 9) {
+        e.preventDefault();
+        if (currentScene && currentScene.toggleEffect) {
+            currentScene.toggleEffect(num);
+        }
+        return;
     }
 }
-
-/**
- * キー状態をリセット（ウィンドウがフォーカスを失った時などに呼ぶ）
- */
-function resetKeyStates() {
-    ctrlPressed = false;
-}
-
-/**
- * ウィンドウがフォーカスを失った時の処理
- */
-function handleWindowBlur() {
-    resetKeyStates();
-    console.log('Window blur: キー状態をリセット');
-}
-
-/**
- * ページの可視性が変わった時の処理
- */
-function handleVisibilityChange() {
-    if (document.hidden) {
-        resetKeyStates();
-        console.log('Page hidden: キー状態をリセット');
-    }
-}
-
-// キーイベントリスナーを登録
-document.addEventListener('keydown', handleKeyDown);
-document.addEventListener('keyup', handleKeyUp);
-
-// ウィンドウのフォーカス状態を監視
-window.addEventListener('blur', handleWindowBlur);
-document.addEventListener('visibilitychange', handleVisibilityChange);
 
 // ============================================
 // 初期化と起動
 // ============================================
 
-function init() {
-    initRenderer();
+async function init() {
+    // レンダラーの初期化
+    renderer = createRenderer();
+    if (!renderer) {
+        return;
+    }
+
+    await renderer.init();
+
+    if (!renderer.backend.isWebGPUBackend) {
+        error("Couldn't initialize WebGPU. Make sure WebGPU is supported by your Browser!");
+        return;
+    }
+
+    // レンダラーをDOMに追加
+    const container = document.getElementById("container") || document.body;
+    container.appendChild(renderer.domElement);
+    // マウスカーソルを非表示
+    renderer.domElement.style.cursor = 'none';
+
+    // カメラの初期化
     initCamera();
+
+    // OSCの初期化
     initOSC();
+
+    // シーンマネージャーを初期化
     initSceneManager();
-    
+
+    // プログレスバーを非表示
+    const veil = document.getElementById("veil");
+    if (veil) {
+        veil.style.opacity = 0;
+    }
+    const progressBar = document.getElementById("progress-bar");
+    if (progressBar) {
+        progressBar.style.opacity = 0;
+    }
+
+    // イベントリスナー
     window.addEventListener('resize', onWindowResize);
-    
-    // デフォルトでフルスクリーンにする
-    // ユーザー操作が必要なため、少し遅延させる
-    setTimeout(() => {
-        if (!document.fullscreenElement) {
-            document.documentElement.requestFullscreen().catch(err => {
-                console.log('フルスクリーンエラー（自動起動失敗）:', err);
-                console.log('F11キーで手動フルスクリーンにできます');
-            });
-        }
-    }, 500);
-    
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keyup', handleKeyUp);
+
+    // リサイズを一度実行
+    onWindowResize();
+
     // アニメーション開始
     animate();
-    
-    console.log('Three.js MAVRX4 Live Visual 起動完了');
+
+    console.log('Three.js MAVRX4 Experiment 起動完了');
 }
 
 // DOM読み込み後に初期化
@@ -408,4 +420,3 @@ if (document.readyState === 'loading') {
 } else {
     init();
 }
-

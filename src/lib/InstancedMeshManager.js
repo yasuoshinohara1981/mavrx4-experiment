@@ -41,6 +41,7 @@ export class InstancedMeshManager {
         // メインのInstancedMeshを作成
         this.mainMesh = new THREE.InstancedMesh(geometry, material, count);
         this.mainMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage); // 動的に更新するため
+        this.mainMesh.frustumCulled = false; // 視錐台カリングを無効化（カメラ切り替え時に見えなくなる問題を防ぐ）
         scene.add(this.mainMesh);
         
         // ワイヤーフレーム用のInstancedMesh（オプション）
@@ -48,6 +49,7 @@ export class InstancedMeshManager {
             this.wireframeMesh = new THREE.InstancedMesh(geometry, this.wireframeMaterial, count);
             this.wireframeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
             this.wireframeMesh.renderOrder = this.wireframeRenderOrder;
+            this.wireframeMesh.frustumCulled = false; // 視錐台カリングを無効化
             scene.add(this.wireframeMesh);
         } else {
             this.wireframeMesh = null;
@@ -151,12 +153,14 @@ export class InstancedMeshManager {
         this.count = newCount;
         this.mainMesh = new THREE.InstancedMesh(this.geometry, this.material, newCount);
         this.mainMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.mainMesh.frustumCulled = false; // 視錐台カリングを無効化
         this.scene.add(this.mainMesh);
         
         if (this.wireframeMaterial) {
             this.wireframeMesh = new THREE.InstancedMesh(this.geometry, this.wireframeMaterial, newCount);
             this.wireframeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
             this.wireframeMesh.renderOrder = this.wireframeRenderOrder;
+            this.wireframeMesh.frustumCulled = false; // 視錐台カリングを無効化
             this.scene.add(this.wireframeMesh);
         }
     }

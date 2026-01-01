@@ -1,999 +1,1657 @@
 /**
- * Scene02: シンプルなsphere接続システム
- * ProcessingのScene02を移植
+ * Scene02 (WebGPU): Simple Curl Noise Particle System
+ * - シンプルに初期値が球体のGPGPUパーティクル
+ * - 150万粒程度
+ * - カールノイズで適当に動かす
+ * - 各パーティクルは疑似sphereにして、疑似ライティングも実装
  */
 
 import { SceneBase } from '../SceneBase.js';
-import { Scene02_RedSphere } from './Scene02_RedSphere.js';
-// import { Scene02_YellowSphere } from './Scene02_YellowSphere.js';  // 黄色いsphereをコメントアウト
-import { Scene02_Connection } from './Scene02_Connection.js';
-import { Scene02_Scope } from './Scene02_Scope.js';
-import * as THREE from 'three';
+import * as THREE from "three/webgpu";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+import hdri from '../../assets/autumn_field_puresky_1k.hdr';
+import { clamp, max, pow, abs, attribute } from "three/tsl";
+import { SimpleParticleSystem } from './SimpleParticleSystem.js';
+import { GridRuler3D } from '../../lib/GridRuler3D.js';
+import { RandomLFO } from '../../lib/RandomLFO.js';
+import { conf } from '../../common/conf.js';
+import { loadHdrCached } from '../../lib/hdrCache.js';
+import { CameraMode } from '../../lib/CameraParticle.js';
 
 export class Scene02 extends SceneBase {
-    constructor(renderer, camera) {
+    constructor(renderer, camera, sharedResourceManager = null) {
         super(renderer, camera);
-        this.title = 'mathym | bng bng';
+        this.title = 'mathym | Scene02 - Curl Noise Particles';
         
-        // 表示設定
+        this.sharedResourceManager = sharedResourceManager;
+        
+        // カメラパーティクル設定
+        this.cameraParticles = [];
+        this.currentCameraIndex = 0;
+        this.cameraCenter = new THREE.Vector3(0, 0, 0);
+        this.currentBar = 0;
+        this.lastForceRandomizedBar = 0;
+        
+        // トラックのON/OFF
+        this.trackEffects = {
+            1: true,   // camera randomize
+            2: true,   // invert
+            3: true,   // chroma
+            4: true,   // glitch
+            5: true,   // シーン固有の処理
+            6: false,
+            7: false,
+            8: false,  // 触手エフェクト（削除）
+            9: false,
+        };
+
+        // 表示
         this.SHOW_PARTICLES = true;
-        this.SHOW_LINES = true;
         
-        // リスト
-        this.redSpheres = [];
-        // this.yellowSpheres = [];  // 黄色いsphereをコメントアウト
-        this.connections = [];
-        this.activeScopes = [];
+        // 3Dオブジェクトとしてのグリッド＋ルーラー（遮蔽が効く）
+        this.SHOW_WORLD_GRID = true; // gキーのデフォルトON
+        this.worldGrid = null;
+        this.boundaryBox = null;
+
+        // ===== RandomLFO（シーンの“ゆれ”）=====
+        this.yureLFO = {
+            noiseScale: null,
+            heightAmp: null,
+            noiseSpeed: null
+        };
+
+        // モード切替（フラグ式）
+        // - ノイズは無効化（Track5の圧力のみ使用）
+        // - 圧力モードをデフォルトON
+        this.ENABLE_YURE_LFO = false;
+        this.ENABLE_PRESSURE = true;
+        // ノイズモード（球面固定/球面を流す）
+        this.ENABLE_FLOW_ON_SPHERE = false;
+
+        // Track5: 内側からの圧力パルス（前回からの間隔で"遠い方向"を引きやすく）
+        this._lastPressureMs = 0;
+        this._lastPressureDir = null; // THREE.Vector3
+        // モード7（フォロー）の注視点更新用：最後に更新した時刻
+        this._lastFollowTargetUpdateMs = 0;
         
-        // 接続の設定
-        this.NEIGHBOR_DISTANCE = 150.0;
+        // Track5インパルス表示用
+        this.impulseIndicators = [];
+        this.impulseCanvas = null;
+        this.impulseCtx = null;
         
-        // スコープ表示の設定
-        this.SCOPE_DURATION = 60.0;
-        this.SHOW_SCOPES = false;  // スコープとテキストをコメントアウト
+        // ===== トラックオブジェクト（シーン3風） =====
+        // ノイズシード
+        this._noiseSeed = Math.random() * 1000;
         
-        // スコープ用の共有Canvas（全スコープで1つのCanvasを使用してパフォーマンス向上）
-        this.scopeCanvas = null;
-        this.scopeCtx = null;
+        // トラックごとのInstancedMesh
+        this.trackObjects = {
+            track1: null, // トーラス
+            track2: null, // ボックス
+            track3: null, // 円柱+サークル
+            track4: null  // 金属片
+        };
         
-        // 5キーの状態
-        this.key5Pressed = false;
-        this.growingSphere = null;
-        this.growingSphereScale = 1.0;
-        
-        // リセットフラグ（sphere数が300を超えたら次のトラック2でリセット）
-        this.shouldResetOnTrack2 = false;
-        
-        // 前回のSphereの情報
-        this.lastSpherePosition = null;
-        this.lastSphereTime = 0;
-        
-        // レーザースキャンパラメータ
-        this.laserScanActive = false;
-        this.scanY = 500.0;
-        this.scanSpeed = 5.0;
-        this.scanWidth = 20.0;
-        this.scanStartY = 500.0;
-        this.scanEndY = -500.0;
-        
-        // シェーダー描画用（一時的に無効化して動作確認）
-        this.useShaderRendering = false;  // まずは通常描画で動作確認
-        this.useShaderLineRendering = false;  // まずは通常描画で動作確認
-        
-        // 被写界深度パラメータ（DOF無効化）
-        this.focusDistance = 0.0;
-        this.depthRange = 500.0;
-        this.depthBlurStrength = 0.0;  // DOFエフェクトを無効化
-        this.lineDepthBlurStrength = 0.0;  // 線のDOFエフェクトを無効化
-        
-        // マテリアルパラメータ
-        this.materialRoughness = 0.85;  // 0.7 → 0.85 に上げてマットな質感に
-        
-        // SSAOパラメータ
-        this.useSSAO = true;
-        this.ssaoRadius = 50.0;
-        this.ssaoStrength = 0.3;
-        this.ssaoSamples = 8;
-        
-        // ライト用パラメータ
-        this.lightPosition = null;
-        this.lightColorValue = null;
-        
-        // Three.js用のオブジェクト
-        this.sphereGroup = null;  // 赤いsphereと黄色いsphereのグループ
-        this.lineGroup = null;  // 接続線のグループ
-        this.laserScanGroup = null;  // レーザースキャンのグループ
-        
-        // シェーダーマテリアル
-        this.sphereMaterial = null;
-        this.lineMaterial = null;
-        
-        // スクリーンショット用テキスト
-        this.setScreenshotText(this.title);
+        // トラックごとのデータ配列
+        this.trackData = {
+            track1: { instances: [], maxCount: 50 },
+            track2: { instances: [], maxCount: 50 },
+            track3: { instances: [], maxCount: 50 },
+            track4: { instances: [], maxCount: 50 }
+        };
     }
     
     async setup() {
-        // 親クラスのsetup()を呼ぶ（ColorInversionの初期化を含む）
         await super.setup();
         
-        // カメラパーティクルの距離パラメータを再設定（親クラスで設定された後に上書き）
-        if (this.cameraParticles) {
-            for (const cameraParticle of this.cameraParticles) {
-                this.setupCameraParticleDistance(cameraParticle);
+        // スクリーンショット用テキストを設定
+        this.setScreenshotText(this.title);
+        
+        // カメラ設定
+        this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
+        this.camera.position.set(0, 0, 2);
+        this.camera.updateProjectionMatrix();
+        
+        // シーン設定
+        this.scene = new THREE.Scene();
+        this.overlayScene = new THREE.Scene();
+        this.overlayScene.background = null;
+        
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.target.set(0, 0, 0);
+        this.controls.enableDamping = true;
+        this.controls.enablePan = false;
+        this.controls.maxDistance = 5.0;
+        this.controls.minDistance = 0.5;
+        this.controls.enabled = false;
+
+        // HDRテクスチャを読み込み（キャッシュ）→ 共通適用
+        const hdriTexture = await loadHdrCached(hdri);
+        this.applyHdriEnvironment(hdriTexture);
+        
+        // シーン固有のシャドウ設定（conf.jsに依存せず、シーンごとに独立）
+        // Scene02: シャドウ有効（パーティクルシステムで影が重要）
+        this._shadowMapEnabled = true;
+        this._shadowMapType = THREE.PCFSoftShadowMap;
+        this.renderer.shadowMap.enabled = this._shadowMapEnabled;
+        this.renderer.shadowMap.type = this._shadowMapType;
+        
+        // パーティクルシステムを初期化
+        this.particleSystem = new SimpleParticleSystem(this.renderer);
+        await this.particleSystem.init();
+        this.scene.add(this.particleSystem.object);
+        this.particleSystem.object.visible = !!this.SHOW_PARTICLES;
+        this.particleSystem.computeEnabled = !!this.SHOW_PARTICLES;
+
+        // NOTE: 塗りは撤去（ユーザー要望）
+
+        // ===== RandomLFOでノイズパラメータをゆっくり揺らす =====
+        // - noiseScale: 最小をもっと小さく（粗い→細かいのレンジを広げる）、最大は現状キープ
+        // - heightAmp: 最大をもっと強く（盛り上がりMAXを上げる）
+        // - LFO自体の周波数: 少しだけゆっくりに（rateレンジを下げる）
+        const lfoMinRate = 0.0006;
+        // 周期側の最大スピードが早すぎるので抑える
+        const lfoMaxRate = 0.0025;
+        this.yureLFO.noiseScale = new RandomLFO(lfoMinRate, lfoMaxRate, 0.55, 3.6);
+        this.yureLFO.heightAmp = new RandomLFO(lfoMinRate, lfoMaxRate, 0.24, 0.92);
+        this.yureLFO.noiseSpeed = new RandomLFO(lfoMinRate, lfoMaxRate, 0.010, 0.060);
+        
+        // actual_tickで変化させるための初期値保存
+        this._lfoInitialParams = {
+            noiseScale: {
+                minRate: lfoMinRate,
+                maxRate: lfoMaxRate,
+                minValue: 0.55,
+                maxValue: 3.6
+            },
+            heightAmp: {
+                minRate: lfoMinRate,
+                maxRate: lfoMaxRate,
+                minValue: 0.24,
+                maxValue: 0.92
+            },
+            noiseSpeed: {
+                minRate: lfoMinRate,
+                maxRate: lfoMaxRate,
+                minValue: 0.010,
+                maxValue: 0.060
             }
+        };
+        
+        // actual_tickの最大値（100小節 = 96 tick * 4拍 * 100小節 = 38400 tick）
+        // デフォルトは100小節分
+        this._tickMaxTicks = 38400;
+
+        // ノイズを物凄く薄く掛ける（heightAmpを非常に小さい値に設定）
+        this.particleSystem.uniforms.heightAmp.value = 0.03; // 物凄く薄いノイズ
+        
+        // NOTE: ENABLE_YURE_LFO が true のときだけuniformへ反映する（現在は無効化）
+        if (this.ENABLE_YURE_LFO) {
+            this.yureLFO.noiseScale.update(1 / 60);
+            this.yureLFO.heightAmp.update(1 / 60);
+            this.yureLFO.noiseSpeed.update(1 / 60);
+            this.particleSystem.uniforms.noiseScale.value = this.yureLFO.noiseScale.getValue();
+            this.particleSystem.uniforms.heightAmp.value = this.yureLFO.heightAmp.getValue();
+            this.particleSystem.uniforms.noiseSpeed.value = this.yureLFO.noiseSpeed.getValue();
         }
-        
-        // ライト位置を初期化
-        this.initializeLightPosition();
-        
-        // ライトを追加
-        this.setupLights();
-        
-        // シェーダーマテリアルを初期化
-        await this.initShaders();
-        
-        // グループを作成
-        this.sphereGroup = new THREE.Group();
-        this.lineGroup = new THREE.Group();
-        this.laserScanGroup = new THREE.Group();
-        this.scene.add(this.sphereGroup);
-        this.scene.add(this.lineGroup);
-        this.scene.add(this.laserScanGroup);
-        
-        // スコープ用の共有Canvasを初期化
-        if (this.SHOW_SCOPES) {
-            this.scopeCanvas = document.createElement('canvas');
-            this.scopeCanvas.width = window.innerWidth;
-            this.scopeCanvas.height = window.innerHeight;
-            this.scopeCanvas.style.position = 'absolute';
-            this.scopeCanvas.style.top = '0';
-            this.scopeCanvas.style.left = '0';
-            this.scopeCanvas.style.pointerEvents = 'none';
-            this.scopeCanvas.style.zIndex = '1000';
-            this.scopeCtx = this.scopeCanvas.getContext('2d');
-            // フォントを一度だけ設定（パフォーマンス最適化）
-            this.scopeCtx.font = '14px monospace';
-            this.scopeCtx.textAlign = 'center';
-            this.scopeCtx.textBaseline = 'top';
-            document.body.appendChild(this.scopeCanvas);
+
+        // ノイズモード初期反映
+        if (this.particleSystem?.uniforms?.flowOnSphereEnabled) {
+            this.particleSystem.uniforms.flowOnSphereEnabled.value = this.ENABLE_FLOW_ON_SPHERE ? 1.0 : 0.0;
         }
-    }
-    
-    /**
-     * ライト位置を初期化
-     */
-    initializeLightPosition() {
-        const lightDistance = 2000.0;
-        const angle1 = Math.random() * Math.PI * 2;
-        const angle2 = Math.random() * (Math.PI / 3 - Math.PI / 6) + Math.PI / 6;
-        
-        this.lightPosition = new THREE.Vector3(
-            lightDistance * Math.sin(angle2) * Math.cos(angle1),
-            lightDistance * Math.cos(angle2),
-            lightDistance * Math.sin(angle2) * Math.sin(angle1)
+
+        // 圧力モードはデフォOFF（GPU側も軽量化）
+        if (this.particleSystem?.setPressureModeEnabled) {
+            this.particleSystem.setPressureModeEnabled(!!this.ENABLE_PRESSURE);
+        }
+
+        // ===== CameraParticle（Track1 / barでランダム化）=====
+        // NOTE:
+        // - 粒子の半径が確定してから（uniform反映後）カメラ範囲を決める
+        // - 近づき過ぎると疑似sphereの粗が見えるので、距離は“遠め”に固定
+        const { CameraParticle } = await import('../../lib/CameraParticle.js');
+        this.cameraParticles = [];
+        this.currentCameraIndex = 0;
+        this.cameraCenter = this.controls.target.clone();
+
+        const baseR_cam = Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.1);
+        const ampR_cam = Number(this.particleSystem?.uniforms?.heightAmp?.value ?? 0.38);
+        const rMax_cam = Math.max(0.2, baseR_cam + ampR_cam);
+
+        // Scene01と同じ方式：CameraParticleを「箱の中」で泳がせる（距離クランプはしない）
+        // NOTE:
+        // カメラ用のBox（サイドパンとオービット用に広く）
+        const camBoxSizeX = rMax_cam * 8.0; // X方向を大きく（サイドパン用）
+        const camBoxSizeY = rMax_cam * 8.0; // Y方向を大きく（オービット用）
+        const camBoxSizeZ = rMax_cam * 8.0; // Z方向を大きく（オービット用）
+        const camBoxZCenter = rMax_cam * 3.0; // Z中心をプラス方向にシフト
+        const boxMin = new THREE.Vector3(
+            -camBoxSizeX / 2,
+            -camBoxSizeY / 2,
+            camBoxZCenter - camBoxSizeZ / 2
         );
+        const boxMax = new THREE.Vector3(
+            camBoxSizeX / 2,
+            camBoxSizeY / 2,
+            camBoxZCenter + camBoxSizeZ / 2
+        );
+        // 念のため：球の中へ入らない最小距離（ワールド）
+        // カメラを離すために、最小距離も大きくする
+        this.cameraMinDistanceWorld = rMax_cam * 1.50;
+
+        // カメラモード用の状態管理（_setupCameraModeより前に初期化）
+        this.cameraModeState = {
+            sidePanDirection: Math.random() > 0.5 ? 1 : -1, // 左→右 or 右→左
+            sidePanSpeed: 0.02,
+            orbitAngle: 0, // 初期角度（_setupCameraModeでランダムに設定される）
+            orbitRadius: rMax_cam * 2.8,
+            orbitSpeed: 0.0008, // 回転速度を弱く（0.01 → 0.0008）
+            followTarget: new THREE.Vector3(0, 0, 0),
+            followLerp: 0.05, // 追従の遅延
+            offCenterOffset: new THREE.Vector3(
+                (Math.random() - 0.5) * 0.3,
+                (Math.random() - 0.5) * 0.3,
+                0
+            )
+        };
+
+        // カメラモード定義
+        const cameraModes = [
+            { name: 'frontWide', mode: 0 },      // ① フロント・ワイド
+            { name: 'frontMedium', mode: 1 },   // ② フロント・ミディアム
+            { name: 'closeup', mode: 2 },       // ③ クローズアップ
+            { name: 'sidePan', mode: 3 },       // ④ サイド・パン
+            { name: 'offCenter', mode: 4 },     // ⑤ オフセンター固定
+            { name: 'slowOrbit', mode: 5 },     // ⑥ スロー・オービット
+            { name: 'follow', mode: 6 },        // ⑦ フォロー
+            { name: 'still', mode: 7 }           // ⑧ 静止ショット
+        ];
+
+        // 各モード用のCameraParticleを作成
+        for (let i = 0; i < 8; i++) {
+            const cp = new CameraParticle();
+            const modeInfo = cameraModes[i];
+            cp.cameraMode = modeInfo.mode;
+            cp.modeName = modeInfo.name;
+            
+            // モードに応じた初期設定
+            cp.setupCameraMode(modeInfo.mode, rMax_cam, boxMin, boxMax);
+            
+            this.cameraParticles.push(cp);
+        }
+
+        // カメラパーティクルの可視化（c/C）を共通化：SceneBase側で描画
+        this.initCameraDebug(this.overlayScene);
         
-        // HSL色空間で色を生成
-        const hue = Math.random() * 60;
-        const saturation = Math.random() * 30 + 70;
-        const brightness = Math.random() * 20 + 80;
-        this.lightColorValue = new THREE.Color();
-        this.lightColorValue.setHSL(hue / 360, saturation / 100, brightness / 100);
-    }
-    
-    /**
-     * ライトを設定
-     */
-    setupLights() {
-        // 環境光を弱くしてコントラストを上げる
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.15);  // 0.2 → 0.15 に下げてコントラスト強化
+        // カメラパーティクル用のライトを追加
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
         this.scene.add(ambientLight);
         
-        // 指向性ライト（動的に生成された位置と色）
-        if (this.lightPosition && this.lightColorValue) {
-            const directionalLight = new THREE.DirectionalLight(this.lightColorValue, 1.2);  // 0.5 → 1.2 に上げてライトの影響を強く
-            directionalLight.position.copy(this.lightPosition);
-            this.scene.add(directionalLight);
-        }
-    }
-    
-    /**
-     * シェーダーを初期化
-     */
-    async initShaders() {
-        if (this.useShaderRendering) {
-            try {
-                const shaderBasePath = `/shaders/scene02/`;
-                const [vertexShader, fragmentShader] = await Promise.all([
-                    fetch(`${shaderBasePath}particle_vert.glsl`).then(r => r.text()).catch(() => null),
-                    fetch(`${shaderBasePath}particle_frag.glsl`).then(r => r.text()).catch(() => null)
-                ]);
-                
-                if (vertexShader && fragmentShader) {
-                    this.sphereMaterial = new THREE.ShaderMaterial({
-                        vertexShader: vertexShader,
-                        fragmentShader: fragmentShader,
-                        uniforms: {
-                            cameraPosition: { value: new THREE.Vector3() },
-                            focusDistance: { value: 0.0 },
-                            depthRange: { value: this.depthRange },
-                            depthBlurStrength: { value: this.depthBlurStrength },
-                            lightPosition: { value: this.lightPosition || new THREE.Vector3() },
-                            lightColor: { value: this.lightColorValue || new THREE.Color(1, 1, 1) },
-                            materialRoughness: { value: this.materialRoughness },
-                            useSSAO: { value: this.useSSAO },
-                            ssaoRadius: { value: this.ssaoRadius },
-                            ssaoStrength: { value: this.ssaoStrength },
-                            ssaoSamples: { value: this.ssaoSamples },
-                            sphereColor: { value: new THREE.Color(1, 0, 0) },  // デフォルト色（各sphereで上書き）
-                            sphereLife: { value: 1.0 }  // デフォルト寿命（透明度制御用）
-                        },
-                        transparent: true,
-                        side: THREE.DoubleSide
-                    });
-                    console.log('Scene02 sphere shader loaded successfully');
-                } else {
-                    console.warn('Could not load Scene02 sphere shader files. Using fallback rendering.');
-                    this.useShaderRendering = false;
-                }
-            } catch (err) {
-                console.error('Error loading Scene02 sphere shaders:', err);
-                this.useShaderRendering = false;
-            }
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(5, 10, 7.5);
+        this.scene.add(directionalLight);
+
+        // 初期フレームで球体内部に入らないよう、初期カメラ位置も外へ
+        const cp0 = this.cameraParticles[0];
+        if (cp0) {
+            const p0 = cp0.getPosition().clone().add(this.cameraCenter);
+            this.camera.position.copy(p0);
+            this.camera.lookAt(this.cameraCenter);
         }
         
-        if (this.useShaderLineRendering) {
-            try {
-                const shaderBasePath = `/shaders/scene02/`;
-                const [vertexShader, fragmentShader] = await Promise.all([
-                    fetch(`${shaderBasePath}line_vert.glsl`).then(r => r.text()).catch(() => null),
-                    fetch(`${shaderBasePath}line_frag.glsl`).then(r => r.text()).catch(() => null)
-                ]);
-                
-                if (vertexShader && fragmentShader) {
-                    this.lineMaterial = new THREE.ShaderMaterial({
-                        vertexShader: vertexShader,
-                        fragmentShader: fragmentShader,
-                        uniforms: {
-                            cameraPosition: { value: new THREE.Vector3() },
-                            focusDistance: { value: 0.0 },
-                            depthRange: { value: this.depthRange },
-                            depthBlurStrength: { value: this.lineDepthBlurStrength },
-                            lightPosition: { value: this.lightPosition || new THREE.Vector3() },
-                            lightColor: { value: this.lightColorValue || new THREE.Color(1, 1, 1) },
-                            materialRoughness: { value: this.materialRoughness }
-                        },
-                        transparent: true,
-                        side: THREE.DoubleSide
-                    });
-                    console.log('Scene02 line shader loaded successfully');
-                } else {
-                    console.warn('Could not load Scene02 line shader files. Using fallback rendering.');
-                    this.useShaderLineRendering = false;
-                }
-            } catch (err) {
-                console.error('Error loading Scene02 line shaders:', err);
-                this.useShaderLineRendering = false;
-            }
-        }
-    }
-    
-    /**
-     * カメラパーティクルの距離パラメータを設定（Scene02用：近くに）
-     */
-    setupCameraParticleDistance(cameraParticle) {
-        cameraParticle.minDistance = 2000.0;  // 3500.0 → 2000.0 に変更（近くに）
-        cameraParticle.maxDistance = 5000.0;  // 8000.0 → 5000.0 に変更（近くに）
-        cameraParticle.maxDistanceReset = 3500.0;  // 6000.0 → 3500.0 に変更（近くに）
-    }
-    
-    /**
-     * 更新処理
-     */
-    onUpdate(deltaTime) {
-        // 時間を更新（HUD表示用、Scene02はdeltaTimeを使用）
-        this.time += deltaTime;
-        
-        // 黄色いsphereを更新 - コメントアウト
-        // this.yellowSpheres = this.yellowSpheres.filter(ys => {
-        //     ys.update();
-        //     if (ys.isDead()) {
-        //         ys.dispose(this.scene);
-        //         return false;
-        //     }
-        //     return true;
-        // });
-        
-        // 5キーが押されている間、生成されたsphereを大きくする
-        if (this.key5Pressed && this.growingSphere) {
-            this.growingSphereScale += 0.05;
-            this.growingSphere.setScale(this.growingSphereScale);
-        }
-        
-        // 接続を更新
-        this.updateConnections();
-        
-        // スコープを更新（無効化されている場合はスキップ）
-        if (this.SHOW_SCOPES) {
-            // 共有Canvasをクリア
-            if (this.scopeCtx) {
-                this.scopeCtx.clearRect(0, 0, this.scopeCanvas.width, this.scopeCanvas.height);
-            }
-            
-            this.activeScopes = this.activeScopes.filter(scope => {
-                scope.update();
-                if (scope.isDead()) {
-                    scope.dispose(this.scene);
-                    return false;
-                }
-                // 共有Canvasを使用して描画
-                scope.updateThreeObjects(this.scopeCtx, this.scopeCanvas);
-                return true;
-            });
-        } else {
-            // スコープが無効化されている場合は全てクリア
-            if (this.scopeCtx) {
-                this.scopeCtx.clearRect(0, 0, this.scopeCanvas.width, this.scopeCanvas.height);
-            }
-            this.activeScopes.forEach(scope => {
-                scope.dispose(this.scene);
-            });
-            this.activeScopes = [];
-        }
-        
-        // レーザースキャンの更新
-        if (this.laserScanActive) {
-            this.scanY -= this.scanSpeed;
-            if (this.scanY < this.scanEndY) {
-                this.scanY = this.scanStartY;
-            }
-        }
-        
-        // Three.jsオブジェクトを更新
-        this.updateThreeObjects();
-        
-        // HUDのOBJECTSにsphereの数を設定
-        this.setParticleCount(this.redSpheres.length);
-    }
-    
-    /**
-     * Three.jsオブジェクトを更新
-     */
-    updateThreeObjects() {
-        // 赤いsphereを更新
-        this.redSpheres.forEach(sphere => {
-            sphere.updateThreeObjects();
+        // ===== 床グリッド（Scene01と同系統に統一） =====
+        // Scene02は球体なので、球を収めるBoxを仮定して床を作る
+        const baseR_grid = Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 0.75);
+        const ampR_grid = Number(this.particleSystem?.uniforms?.heightAmp?.value ?? 0.28);
+        const rMax_grid = Math.max(0.2, baseR_grid + ampR_grid);
+        const boxSize = rMax_grid * 2.6; // 少し余白
+        const boxCenterX = 0.0;
+        const boxCenterY = 0.0;
+        const boxCenterZ = 0.0;
+        const boxSizeX = boxSize;
+        const boxSizeY = boxSize;
+        const boxSizeZ = boxSize;
+        const floorY = -rMax_grid - 0.002;
+        // Scene01 と同じスケール感に寄せる（赤い十字/ラベルは labelMax=64 前提）
+        const floorSize = boxSize * 2.2;
+
+        this.worldGrid = new GridRuler3D();
+        this.worldGrid.init({
+            center: { x: boxCenterX, y: boxCenterY, z: boxCenterZ },
+            size: { x: boxSizeX, y: boxSizeY, z: boxSizeZ },
+            floorSize,
+            floorY,
+            color: 0xffffff,
+            opacity: 0.25
         });
-        
-        // 黄色いsphereを更新 - コメントアウト
-        // this.yellowSpheres.forEach(sphere => {
-        //     sphere.updateThreeObjects();
-        // });
-        
-        // 接続線を更新（SHOW_LINESがtrueの場合のみ）
-        if (this.SHOW_LINES && this.lineGroup) {
-            this.updateConnectionLines();
-        }
-        
-        // レーザースキャンを更新
-        if (this.laserScanActive) {
-            this.updateLaserScan();
-        }
-        
-        // シェーダーのuniformを更新（シェーダーが有効な場合のみ）
-        if (this.useShaderRendering && this.sphereMaterial) {
-            const eye = this.cameraParticles[this.currentCameraIndex]?.getPosition() || new THREE.Vector3();
-            const center = new THREE.Vector3(0, 0, 0);
-            const centerDistance = center.distanceTo(eye);
-            
-            this.sphereMaterial.uniforms.cameraPosition.value.copy(eye);
-            this.sphereMaterial.uniforms.focusDistance.value = centerDistance;
-            this.sphereMaterial.uniforms.lightPosition.value.copy(this.lightPosition || new THREE.Vector3());
-            this.sphereMaterial.uniforms.lightColor.value.copy(this.lightColorValue || new THREE.Color(1, 1, 1));
-        }
-        
-        if (this.useShaderLineRendering && this.lineMaterial) {
-            const eye = this.cameraParticles[this.currentCameraIndex]?.getPosition() || new THREE.Vector3();
-            const center = new THREE.Vector3(0, 0, 0);
-            const centerDistance = center.distanceTo(eye);
-            
-            this.lineMaterial.uniforms.cameraPosition.value.copy(eye);
-            this.lineMaterial.uniforms.focusDistance.value = centerDistance;
-            this.lineMaterial.uniforms.lightPosition.value.copy(this.lightPosition || new THREE.Vector3());
-            this.lineMaterial.uniforms.lightColor.value.copy(this.lightColorValue || new THREE.Color(1, 1, 1));
-        }
-        
-    }
-    
-    /**
-     * 接続線を更新
-     */
-    updateConnectionLines() {
-        // lineGroupが初期化されていない場合は何もしない
-        if (!this.lineGroup) {
-            return;
-        }
-        
-        if (!this.SHOW_LINES) {
-            // 表示しない場合は全て削除
-            this.lineGroup.children.forEach(line => {
-                line.geometry.dispose();
-                line.material.dispose();
-            });
-            this.lineGroup.clear();
-            return;
-        }
-        
-        // 接続数が変わった場合のみ再作成
-        const currentLineCount = this.lineGroup.children.length;
-        const targetLineCount = this.connections.length;
-        
-        if (currentLineCount !== targetLineCount) {
-            // 既存の線を削除
-            this.lineGroup.children.forEach(line => {
-                line.geometry.dispose();
-                line.material.dispose();
-            });
-            this.lineGroup.clear();
-            
-            // 新しい接続線を作成
-            this.connections.forEach(conn => {
-                const fromPos = conn.from.getPosition();
-            const toPos = conn.target.getPosition();
-            
-            if (this.useShaderLineRendering && this.lineMaterial) {
-                // シェーダー描画
-                const geometry = new THREE.BufferGeometry();
-                const positions = new Float32Array([
-                    fromPos.x, fromPos.y, fromPos.z,
-                    toPos.x, toPos.y, toPos.z
-                ]);
-                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                
-                const line = new THREE.Line(geometry, this.lineMaterial.clone());
-                this.lineGroup.add(line);
-            } else {
-                // 通常描画
-                const geometry = new THREE.BufferGeometry();
-                const positions = new Float32Array([
-                    fromPos.x, fromPos.y, fromPos.z,
-                    toPos.x, toPos.y, toPos.z
-                ]);
-                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                
-                const eye = this.cameraParticles[this.currentCameraIndex]?.getPosition() || new THREE.Vector3();
-                const lineCenter = new THREE.Vector3().addVectors(fromPos, toPos).multiplyScalar(0.5);
-                const lineDistance = lineCenter.distanceTo(eye);
-                const centerDistance = new THREE.Vector3(0, 0, 0).distanceTo(eye);
-                
-                // ライティング対応のため、CylinderGeometryを使用してMeshとして描画
-                const distance = fromPos.distanceTo(toPos);
-                const direction = new THREE.Vector3().subVectors(toPos, fromPos).normalize();
-                const midPoint = new THREE.Vector3().addVectors(fromPos, toPos).multiplyScalar(0.5);
-                
-                // 円柱のジオメトリを作成（線の太さは1.0）
-                const cylinderGeometry = new THREE.CylinderGeometry(1.0, 1.0, distance, 8, 1);
-                
-                // 円柱を線の方向に回転
-                const up = new THREE.Vector3(0, 1, 0);
-                const quaternion = new THREE.Quaternion().setFromUnitVectors(up, direction);
-                
-                const material = new THREE.MeshStandardMaterial({
-                    color: 0xcccccc,  // 明るいグレー（白より少し暗く）
-                    emissive: 0x333333,  // 発光色を控えめに（ライトの影響を受けやすく）
-                    emissiveIntensity: 0.1,  // 発光強度を下げる
-                    transparent: false,  // 不透明度100%なのでtransparentは不要
-                    opacity: 1.0,  // 常に100%不透明
-                    roughness: 0.8,  // マットな質感に
-                    metalness: 0.2  // メタリック感を控えめに
-                });
-                
-                const lineMesh = new THREE.Mesh(cylinderGeometry, material);
-                lineMesh.position.copy(midPoint);
-                lineMesh.setRotationFromQuaternion(quaternion);
-                this.lineGroup.add(lineMesh);
-                }
-            });
-        } else {
-            // 接続数が同じ場合は位置だけ更新（ただし、毎フレーム更新は重いので、必要に応じてスキップ）
-            // パフォーマンス向上のため、位置の更新はスキップ（接続が変わった時だけ再作成）
-            // もし位置の更新が必要な場合は、以下のコメントを外す
-            /*
-            this.connections.forEach((conn, index) => {
-                if (index < this.lineGroup.children.length) {
-                    const line = this.lineGroup.children[index];
-                    const fromPos = conn.from.getPosition();
-                    const toPos = conn.target.getPosition();
-                    
-                    const positions = new Float32Array([
-                        fromPos.x, fromPos.y, fromPos.z,
-                        toPos.x, toPos.y, toPos.z
-                    ]);
-                    line.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                }
-            });
-            */
-        }
-    }
-    
-    /**
-     * レーザースキャンを更新
-     */
-    updateLaserScan() {
-        // 既存のスキャンを削除
-        this.laserScanGroup.children.forEach(obj => {
-            obj.geometry.dispose();
-            obj.material.dispose();
-        });
-        this.laserScanGroup.clear();
-        
-        // スキャンラインの範囲内のsphereを探す
-        const scanSpheres = this.redSpheres.filter(sphere => {
-            const pos = sphere.getPosition();
-            const dist = Math.abs(pos.y - this.scanY);
-            return dist < this.scanWidth;
-        });
-        
-        // スキャンライン付近のsphereを赤い線で描画
-        scanSpheres.forEach(sphere => {
-            const pos = sphere.getPosition();
-            const distFromScan = Math.abs(pos.y - this.scanY);
-            const intensity = THREE.MathUtils.mapLinear(distFromScan, 0, this.scanWidth, 1.0, 0.3);
-            
-            const geometry = new THREE.BufferGeometry();
-            const positions = new Float32Array([
-                pos.x, pos.y - this.scanWidth, pos.z,
-                pos.x, pos.y + this.scanWidth, pos.z
-            ]);
-            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-            
-            const material = new THREE.LineBasicMaterial({
-                color: 0xff0000,
-                transparent: true,
-                opacity: intensity,
-                linewidth: 2
-            });
-            
-            const line = new THREE.Line(geometry, material);
-            this.laserScanGroup.add(line);
-        });
-        
-        // スキャンラインの高さに水平な円を描画（X-Z平面）
-        const circleGeometry = new THREE.RingGeometry(0, 600.0, 64);
-        const circleMaterial = new THREE.MeshBasicMaterial({
-            color: 0xff0000,
+        this.worldGrid.setVisible(this.SHOW_WORLD_GRID);
+        this.scene.add(this.worldGrid.group);
+
+        // 境界Box
+        // NOTE:
+        // overlayScene に入れると「常に最前面合成」になって球体に隠れない。
+        // → scene 側に置いて depthTest で隠れるようにする。
+        const boxGeometry = new THREE.BoxGeometry(boxSizeX, boxSizeY, boxSizeZ);
+        const boxEdges = new THREE.EdgesGeometry(boxGeometry);
+        const boxMaterial = new THREE.LineBasicMaterial({
+            color: 0xffffff,
             transparent: true,
-            opacity: 0.31,  // 80/255
-            side: THREE.DoubleSide
+            opacity: 0.82,
+            depthTest: true,
+            depthWrite: false
         });
-        const circleMesh = new THREE.Mesh(circleGeometry, circleMaterial);
-        circleMesh.position.set(0, this.scanY, 0);
-        circleMesh.rotation.x = -Math.PI / 2;  // X-Z平面に配置
-        this.laserScanGroup.add(circleMesh);
+        const boxWireframe = new THREE.LineSegments(boxEdges, boxMaterial);
+        boxWireframe.position.set(boxCenterX, boxCenterY, boxCenterZ);
+        this.scene.add(boxWireframe);
+        this.boundaryBox = boxWireframe;
+
+        // ポストFX（共通）
+        this.initPostFX();
+        
+        // Track5インパルス表示用Canvas
+        this.impulseCanvas = document.createElement('canvas');
+        this.impulseCanvas.width = window.innerWidth;
+        this.impulseCanvas.height = window.innerHeight;
+        this.impulseCanvas.style.position = 'absolute';
+        this.impulseCanvas.style.top = '0';
+        this.impulseCanvas.style.left = '0';
+        this.impulseCanvas.style.pointerEvents = 'none';
+        this.impulseCanvas.style.zIndex = '900';
+        this.impulseCtx = this.impulseCanvas.getContext('2d');
+        this.impulseCtx.font = '24px monospace';
+        this.impulseCtx.textAlign = 'center';
+        this.impulseCtx.textBaseline = 'top';
+        document.body.appendChild(this.impulseCanvas);
+        
+        // Track5インパルス表示
+        this.initImpulseIndicator();
+    }
+
+    // ===== ノイズ関数（シーン3と同じ） =====
+    _hash11(n) {
+        const x = Math.sin(n * 127.1 + this._noiseSeed * 0.17) * 43758.5453123;
+        return x - Math.floor(x);
+    }
+    
+    _noise1D(x) {
+        const i = Math.floor(x);
+        const f = x - i;
+        const a = this._hash11(i);
+        const b = this._hash11(i + 1);
+        const u = f * f * (3.0 - 2.0 * f);
+        return a * (1.0 - u) + b * u;
     }
     
     /**
-     * 描画処理
+     * トラックオブジェクトの初期化
      */
-    render() {
-        // SceneBaseのrenderメソッドを使用（色反転、glitch、chromaticAberrationを含む）
-        super.render();
+    _initTrackObjects() {
+        const dummy = new THREE.Object3D();
+        
+        // マテリアル
+        const matMetal = new THREE.MeshStandardMaterial({
+            color: 0x222222,
+            metalness: 0.9,
+            roughness: 0.2
+        });
+        
+        const matAccent = new THREE.MeshStandardMaterial({
+            color: 0xccaa66,
+            metalness: 0.8,
+            roughness: 0.3
+        });
+        
+        // Track1: トーラス
+        const torusGeom = new THREE.TorusGeometry(0.05, 0.02, 16, 32);
+        this.trackObjects.track1 = new THREE.InstancedMesh(
+            torusGeom,
+            matMetal,
+            this.trackData.track1.maxCount
+        );
+        this.trackObjects.track1.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.trackObjects.track1.castShadow = true;
+        this.trackObjects.track1.receiveShadow = true;
+        this.trackObjects.track1.frustumCulled = false;
+        
+        // 初期化（見えない位置に配置）
+        dummy.position.set(0, 0, -9999);
+        dummy.updateMatrix();
+        for (let i = 0; i < this.trackData.track1.maxCount; i++) {
+            this.trackObjects.track1.setMatrixAt(i, dummy.matrix);
+            this.trackData.track1.instances[i] = { active: false };
+        }
+        this.trackObjects.track1.instanceMatrix.needsUpdate = true;
+        this.scene.add(this.trackObjects.track1);
+        
+        // Track2: ボックス
+        const boxGeom = new THREE.BoxGeometry(0.08, 0.08, 0.08);
+        this.trackObjects.track2 = new THREE.InstancedMesh(
+            boxGeom,
+            matAccent,
+            this.trackData.track2.maxCount
+        );
+        this.trackObjects.track2.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.trackObjects.track2.castShadow = true;
+        this.trackObjects.track2.receiveShadow = true;
+        this.trackObjects.track2.frustumCulled = false;
+        
+        for (let i = 0; i < this.trackData.track2.maxCount; i++) {
+            this.trackObjects.track2.setMatrixAt(i, dummy.matrix);
+            this.trackData.track2.instances[i] = { active: false };
+        }
+        this.trackObjects.track2.instanceMatrix.needsUpdate = true;
+        this.scene.add(this.trackObjects.track2);
+        
+        // Track3: 円柱（シンプル版）
+        const cylGeom = new THREE.CylinderGeometry(0.02, 0.02, 0.15, 16);
+        this.trackObjects.track3 = new THREE.InstancedMesh(
+            cylGeom,
+            matMetal,
+            this.trackData.track3.maxCount
+        );
+        this.trackObjects.track3.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.trackObjects.track3.castShadow = true;
+        this.trackObjects.track3.receiveShadow = true;
+        this.trackObjects.track3.frustumCulled = false;
+        
+        for (let i = 0; i < this.trackData.track3.maxCount; i++) {
+            this.trackObjects.track3.setMatrixAt(i, dummy.matrix);
+            this.trackData.track3.instances[i] = { active: false };
+        }
+        this.trackObjects.track3.instanceMatrix.needsUpdate = true;
+        this.scene.add(this.trackObjects.track3);
+        
+        // Track4: 金属片（円柱の一部）- 小さめ
+        const shardGeom = new THREE.CylinderGeometry(
+            0.03, 0.03, 0.08, 24, 1, true, 0, Math.PI * 0.6
+        );
+        shardGeom.rotateY(Math.PI * 0.1);
+        this.trackObjects.track4 = new THREE.InstancedMesh(
+            shardGeom,
+            matMetal,
+            this.trackData.track4.maxCount
+        );
+        this.trackObjects.track4.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.trackObjects.track4.castShadow = true;
+        this.trackObjects.track4.receiveShadow = true;
+        this.trackObjects.track4.frustumCulled = false;
+        
+        for (let i = 0; i < this.trackData.track4.maxCount; i++) {
+            this.trackObjects.track4.setMatrixAt(i, dummy.matrix);
+            this.trackData.track4.instances[i] = { active: false };
+        }
+        this.trackObjects.track4.instanceMatrix.needsUpdate = true;
+        this.scene.add(this.trackObjects.track4);
+        
+        console.log('Scene02: トラックオブジェクト初期化完了');
     }
     
     /**
-     * カメラをランダムに切り替える（OSC用）
+     * SceneManager から呼ばれる：リソースの有効/無効（ライブ用途：disposeはしない）
      */
+    setResourceActive(active) {
+        this._resourceActive = !!active;
+        if (this.particleSystem) {
+            // 非アクティブ時は計算も描画も止める（常駐は維持）
+            this.particleSystem.computeEnabled = this._resourceActive && !!this.SHOW_PARTICLES;
+            this.particleSystem.object.visible = this._resourceActive && !!this.SHOW_PARTICLES;
+        }
+    }
+    
+    onUpdate(deltaTime) {
+        // ノイズを物凄く薄く掛ける（heightAmpを非常に小さい値に保つ）
+        if (this.particleSystem) {
+            this.particleSystem.uniforms.heightAmp.value = 0.03; // 物凄く薄いノイズ
+        }
+        
+        // ===== “ゆれ”更新（RandomLFO / 無効化）=====
+        if (this.ENABLE_YURE_LFO && this.particleSystem && this.yureLFO?.noiseScale) {
+            // deltaTimeはLFO内部で60fps基準処理だが、APIとして渡しておく
+            const dt = (!deltaTime || deltaTime <= 0 || !isFinite(deltaTime)) ? (1 / 60) : deltaTime;
+            this.yureLFO.noiseScale.update(dt);
+            this.yureLFO.heightAmp.update(dt);
+            this.yureLFO.noiseSpeed.update(dt);
+
+            this.particleSystem.uniforms.noiseScale.value = this.yureLFO.noiseScale.getValue();
+            this.particleSystem.uniforms.heightAmp.value = this.yureLFO.heightAmp.getValue();
+            this.particleSystem.uniforms.noiseSpeed.value = this.yureLFO.noiseSpeed.getValue();
+        }
+
+        // パーティクルシステムの更新
+        if (this.particleSystem) {
+            this.particleSystem.update(deltaTime, this.time);
+        }
+        
+        // Track5インパルス表示の更新
+        if (this.updateImpulseIndicator) {
+            this.updateImpulseIndicator();
+        }
+
+        // NOTE: 塗りは撤去（ユーザー要望）
+
+        // ===== CameraParticle update（モード別処理） =====
+        // Scene02では1小節ごとのランダマイズのみ使用（Track1の力は加えない）
+        this.cameraParticles.forEach((cp, idx) => {
+            // モード別の動作は有効化
+            cp.enableMovement = true;
+            
+            // 現在アクティブなカメラのみ、モード別の力を加える
+            if (idx === this.currentCameraIndex) {
+                const rMax = Math.max(0.2, (Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0) + Number(this.particleSystem?.uniforms?.heightAmp?.value ?? 0.03)));
+                
+                
+                // スローオービットの場合は、updateCameraModeで位置を直接設定するので、update()をスキップ
+                if (cp.cameraMode === 5) { // CameraMode.SLOW_ORBIT
+                    cp.updateCameraMode(deltaTime, rMax);
+                    // update()は呼ばない（位置が上書きされるため）
+                } else {
+                    // 通常のモードは、update()してからupdateCameraMode()
+                    cp.update();
+                    cp.updateCameraMode(deltaTime, rMax);
+                }
+            } else {
+                // 非アクティブなカメラは通常のupdate()のみ
+                cp.update();
+            }
+        });
+
+        const cp = this.cameraParticles[this.currentCameraIndex];
+        if (cp) {
+            const cameraPos = this._getCameraPositionForMode(cp);
+            const lookAtTarget = this._getLookAtTargetForMode(cp);
+            
+            // Scene02だけ：球体内部に入らないよう最小距離でクランプ
+            // ただし、サイドパンとスローオービットは除外（自由に動かす）
+            if (this.cameraMinDistanceWorld !== undefined && cp.cameraMode !== 3 && cp.cameraMode !== 5) {
+                const d = cameraPos.length();
+                if (d > 0 && d < this.cameraMinDistanceWorld) {
+                    cameraPos.multiplyScalar(this.cameraMinDistanceWorld / d);
+                }
+            }
+            
+            this.camera.position.copy(cameraPos);
+            this.camera.lookAt(lookAtTarget);
+            this.camera.matrixWorldNeedsUpdate = false;
+            
+        }
+
+        // カメラパーティクルの可視化メッシュを更新
+        this.cameraParticles.forEach((cp) => {
+            if (cp.visualMesh) {
+                cp.visualMesh.position.copy(cp.position);
+                cp.visualMesh.visible = this.SHOW_CAMERA_PARTICLES;
+            }
+        });
+        
+        // 3Dグリッドのラベルをカメラに向ける & 表示トグル反映
+        if (this.worldGrid) {
+            this.worldGrid.setVisible(this.SHOW_WORLD_GRID);
+            this.worldGrid.update(this.camera);
+        }
+        
+        // 共通：FX更新（track2-4 + duration）
+        this.updatePostFX();
+    }
+    
+    async render() {
+        // 初期化が完了しているかチェック
+        if (!this.particleSystem || !this.postProcessing) {
+            return;
+        }
+        // ポストプロセッシング描画（Scene01と同じ）
+        try {
+            await this.postProcessing.renderAsync();
+        } catch (err) {
+            // WebGPU のノード管理エラーをログに出力して確認
+            console.error('Scene02 renderエラー:', err);
+            // エラーが発生してもHUDは表示する
+        }
+        
+        // HUDを描画
+        if (this.hud && this.showHUD) {
+            const hudData = this.getHUDData();
+            const now = performance.now();
+            const frameRate = this.lastFrameTime ? 1.0 / ((now - this.lastFrameTime) / 1000.0) : 60.0;
+            this.lastFrameTime = now;
+            
+            this.hud.display(
+                frameRate,
+                hudData.currentCameraIndex || 0,
+                hudData.cameraPosition || new THREE.Vector3(),
+                0,
+                this.time,
+                0,
+                0,
+                0,
+                0,
+                hudData.isInverted || false,
+                this.oscStatus,
+                hudData.particleCount || this.particleSystem.numParticles,
+                hudData.trackEffects || this.trackEffects,
+                this.phase,
+                hudData.hudScales,
+                null,
+                hudData.currentBar || 0,
+                hudData.debugText || '',
+                this.actualTick || 0,
+                hudData.cameraModeName || null
+            );
+        }
+        
+        // スクリーンショットテキストを描画
+        this.drawScreenshotText();
+    }
+    
+    getHUDData() {
+        const cp = this.cameraParticles?.[this.currentCameraIndex];
+        const cameraPos = cp ? cp.getPosition().clone().add(this.cameraCenter) : this.camera.position.clone();
+        const distance = cameraPos.length();
+        const distToTarget = cp ? cp.getPosition().length() : distance;
+        const rotationX = cp ? cp.getRotationX() : 0;
+        const rotationY = cp ? cp.getRotationY() : 0;
+        const isInverted = this.fxUniforms && this.fxUniforms.invert ? this.fxUniforms.invert.value > 0.0 : false;
+        const updateMode = (this.particleSystem?.updateStride >= 2) ? 'HALF' : 'FULL';
+        const noiseMode = (this.ENABLE_FLOW_ON_SPHERE ? 'FLOW' : 'SPHERE');
+        const debugText = `UPDATE:${updateMode}  NOISE:${noiseMode}  PRESS:${this.ENABLE_PRESSURE ? 'ON' : 'OFF'}  LFO:${this.ENABLE_YURE_LFO ? 'ON' : 'OFF'}`;
+        
+        // カメラモード名を取得
+        const cameraModeName = cp?.modeName || 'unknown';
+
+        return {
+            currentCameraIndex: this.currentCameraIndex,
+            cameraModeName: cameraModeName,
+            cameraPosition: cameraPos,
+            rotationX,
+            rotationY,
+            distance,
+            trackEffects: this.trackEffects,
+            isInverted,
+            currentBar: this.currentBar || 0,
+            debugText,
+            hudScales: {
+                distToTarget,
+                fovDeg: this.camera?.fov ?? 60,
+                cameraY: cameraPos.y
+            },
+            time: this.time,
+            particleCount: this.particleSystem?.numParticles || 0
+        };
+    }
+    
+    handleTrackNumber(trackNumber, message) {
+        const args = message.args || [];
+        const noteNumber = Number(args[0] ?? 64);
+        const velocity = Number(args[1] ?? 127);
+        const durationMs = Number(args[2] ?? 0);
+        
+        if (trackNumber === 1) {
+            // Track1: エフェクトなし（削除）
+        } else if (trackNumber === 2) {
+            this.applyTrack2Invert(velocity, durationMs);
+        } else if (trackNumber === 3) {
+            this.applyTrack3Chromatic(velocity, durationMs);
+        } else if (trackNumber === 4) {
+            this.applyTrack4Glitch(velocity, durationMs);
+        } else if (trackNumber === 5) {
+            this.applyTrack5Pressure(noteNumber, velocity, durationMs);
+        }
+    }
+    
+    /**
+     * トラックオブジェクトの寿命管理
+     */
+    _updateTrackObjects() {
+        // 寿命管理を無効化（常に表示）
+        // NOTE: 必要に応じて有効化できる
+        return;
+        
+        const now = performance.now();
+        const dummy = new THREE.Object3D();
+        dummy.position.set(0, 0, -9999); // 見えない位置
+        dummy.updateMatrix();
+        
+        // 各トラックのオブジェクトをチェック
+        for (const trackKey in this.trackData) {
+            const trackData = this.trackData[trackKey];
+            const trackObj = this.trackObjects[trackKey];
+            if (!trackData || !trackObj) continue;
+            
+            let needsUpdate = false;
+            for (let i = 0; i < trackData.maxCount; i++) {
+                const inst = trackData.instances[i];
+                if (!inst.active) continue;
+                
+                const elapsed = now - inst.startMs;
+                if (elapsed >= inst.durationMs) {
+                    // 寿命切れ：非表示にする
+                    trackObj.setMatrixAt(i, dummy.matrix);
+                    inst.active = false;
+                    needsUpdate = true;
+                }
+            }
+            
+            if (needsUpdate) {
+                trackObj.instanceMatrix.needsUpdate = true;
+            }
+        }
+    }
+    
+    /**
+     * トラックオブジェクトを生成
+     * @param {string} trackKey - 'track1', 'track2', 'track3', 'track4'
+     * @param {number} noteNumber - MIDIノート番号
+     * @param {number} velocity - ベロシティ
+     * @param {number} durationMs - 持続時間
+     */
+    _spawnTrackObject(trackKey, noteNumber = 64, velocity = 96, durationMs = 420) {
+        const trackData = this.trackData[trackKey];
+        const trackObj = this.trackObjects[trackKey];
+        if (!trackData || !trackObj) return;
+        
+        // 空きスロットを探す
+        let idx = -1;
+        for (let i = 0; i < trackData.maxCount; i++) {
+            if (!trackData.instances[i].active) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx === -1) {
+            // 空きがない場合は最も古いものを上書き
+            idx = 0;
+        }
+        
+        const v01 = Math.min(Math.max(velocity / 127, 0), 1);
+        const n01 = Math.min(Math.max(noteNumber / 127, 0), 1);
+        
+        // パーティクルシステムの基準半径を取得
+        const baseRadius = this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0;
+        const heightAmp = this.particleSystem?.uniforms?.heightAmp?.value ?? 0.03;
+        const rMax = baseRadius + heightAmp;
+        
+        // ノイズベースの球面座標を生成
+        const tick = performance.now() * 0.001; // 時間ベースのノイズ
+        const u = tick * 0.01 + n01 * 10.0 + idx * 3.0;
+        const v = tick * 0.008 + v01 * 7.0 + idx * 5.0;
+        
+        // 経度・緯度をノイズで決定
+        const longitude = this._noise1D(u) * Math.PI * 2;
+        const latitude = (this._noise1D(v) * 0.5 + 0.25) * Math.PI; // 45°～135°の範囲
+        
+        // 球面座標から3D座標に変換
+        // パーティクルの表面に配置（rMaxを使用）
+        const r = rMax * (1.0 + 0.1 * v01); // velocityで少し外側に
+        const x = r * Math.sin(latitude) * Math.cos(longitude);
+        const y = r * Math.cos(latitude);
+        const z = r * Math.sin(latitude) * Math.sin(longitude);
+        
+        // サイズをvelocityで変化
+        const scale = (0.5 + 1.5 * v01) * (0.85 + 0.3 * Math.random());
+        
+        // 球面の法線方向（中心から外側）に向ける
+        const normal = new THREE.Vector3(x, y, z).normalize();
+        
+        // インスタンスデータを更新
+        const dummy = new THREE.Object3D();
+        dummy.position.set(x, y, z);
+        
+        // 法線方向にY軸を向ける（円柱が生える方向）
+        // quaternionを使って法線方向にY軸を向ける
+        const up = new THREE.Vector3(0, 1, 0);
+        const quaternion = new THREE.Quaternion();
+        quaternion.setFromUnitVectors(up, normal);
+        dummy.quaternion.copy(quaternion);
+        
+        dummy.scale.setScalar(scale);
+        dummy.updateMatrix();
+        
+        trackObj.setMatrixAt(idx, dummy.matrix);
+        trackObj.instanceMatrix.needsUpdate = true;
+        
+        // データを記録
+        trackData.instances[idx] = {
+            active: true,
+            startMs: performance.now(),
+            durationMs: durationMs,
+            position: new THREE.Vector3(x, y, z),
+            scale: scale
+        };
+    }
+
+    /**
+     * Track5: 球体マッピング上の「高さ」変動（ノイズの代わり）
+     * - ランダムな方向に対して圧力を加えて、球体の高さ（半径）を変動させる
+     * - velocityで強さを変える
+     * - ノイズで掛けていた部分をTrack5で制御
+     * - 前回のシーケンスと近ければ近い場所に、遠ければ遠い場所にランダムになる
+     */
+    applyTrack5Pressure(noteNumber, velocity, durationMs) {
+        if (!this.trackEffects?.[5]) return;
+        if (!this.particleSystem) return;
+
+        // 圧力モードを有効化（Track5が来た時に自動でON）
+        if (!this.ENABLE_PRESSURE) {
+            this.ENABLE_PRESSURE = true;
+            if (this.particleSystem?.setPressureModeEnabled) {
+                this.particleSystem.setPressureModeEnabled(true);
+            }
+        }
+
+        const now = performance.now();
+        const gapMs = this._lastPressureMs > 0 ? (now - this._lastPressureMs) : 9999;
+        this._lastPressureMs = now;
+
+        const v01 = Math.min(Math.max((Number(velocity) || 0) / 127, 0), 1);
+        const gap01 = Math.min(Math.max(gapMs / 1500, 0), 1); // 0..1（1.5sで最大）
+
+        // ランダムな方向（球面上のランダムな点）を生成
+        const theta = Math.random() * Math.PI * 2; // 0..2π
+        const phi = Math.acos(2 * Math.random() - 1); // 0..π
+        const base = new THREE.Vector3(
+            Math.sin(phi) * Math.cos(theta),
+            Math.sin(phi) * Math.sin(theta),
+            Math.cos(phi)
+        ).normalize();
+
+        // gapが小さい（前回と近い）ほど「前回と近い方向」に、大きい（前回と遠い）ほど「前回と遠い方向（反対寄り）」に寄せる
+        let dir = base;
+        if (this._lastPressureDir) {
+            // gap01が小さい（0に近い）→ 前回の方向に近づける
+            // gap01が大きい（1に近い）→ 前回の反対方向に寄せる
+            const far = this._lastPressureDir.clone().multiplyScalar(-1);
+            // gap01が小さいほど base（ランダム）に近く、大きいほど far（反対）に近づく
+            // でも、ユーザーの要望は「近ければ近い場所に」なので、gap01が小さいほど前回に近づける
+            const lerpFactor = 1.0 - gap01; // gap01が小さい（0）→ lerpFactorが大きい（1）→ 前回に近い
+            dir = base.clone().lerp(this._lastPressureDir, lerpFactor * 0.7).normalize();
+        }
+        this._lastPressureDir = dir.clone();
+
+        // 強さ（velocity依存 + ランダム）
+        // ノイズの代わりなので、もっと弱めに調整
+        const randMul = 0.7 + Math.random() * 0.6; // 0.7..1.3
+        const strength = (0.02 + 0.10 * Math.pow(v01, 1.2)) * randMul; // さらに弱める（約半分）
+
+        // 範囲（角度）：velocity高いほど絞る、ランダム要素も追加
+        const baseAngle = 0.8 - 0.5 * v01; // 0.3..0.8 rad
+        const angle = baseAngle + (Math.random() - 0.5) * 0.2; // ±0.1 rad のランダム
+
+        // 速度上限も velocity に合わせて上げる（弱めに調整）
+        const velMax = (0.4 + 0.9 * Math.pow(v01, 1.1)) * (0.85 + Math.random() * 0.3);
+        // 上限の高さを無効化（非常に大きな値に設定）
+        const offsetMax = 999999.0; // 実質的に上限なし
+        this.particleSystem.setPressureTuning({ velMax, offsetMax });
+
+        // 永続圧力（粒子offsetVelへインパルス→offsetへ積分）
+        // これが球体マッピング上の「高さ」変動になる
+        this.particleSystem.applyPressure(dir, strength, angle);
+        
+        // Circleエフェクトとテキスト、赤いsphereを表示
+        const baseR = Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.1);
+        const posWorld = dir.clone().multiplyScalar(baseR);
+        this.triggerImpulseIndicator({
+            dir: dir.clone(),
+            posWorld: posWorld,
+            strength: strength,
+            angle: angle,
+            velocity: velocity
+        });
+        
+        // モード7（フォロー）の注視点を更新（1秒以内の連続したイベントは無視）
+        const nowForFollow = performance.now();
+        const gapFollowMs = nowForFollow - this._lastFollowTargetUpdateMs;
+        if (gapFollowMs >= 1000) { // 1秒以上経過している場合のみ更新
+            const followCp = this.cameraParticles.find(cp => cp.cameraMode === 6);
+            if (followCp && followCp._followTarget) {
+                followCp._followTarget.copy(posWorld);
+                this._lastFollowTargetUpdateMs = nowForFollow;
+            }
+        }
+    }
+    
+    // ===== Track5 indicator =====
+    initImpulseIndicator() {
+        const max = 8; // 最大8個のインパルスを同時表示
+        this.impulseIndicators = [];
+        
+        const sphereGeom = new THREE.SphereGeometry(0.02, 16, 16);
+        const sphereMatBase = new THREE.MeshStandardMaterial({
+            color: 0xff0000,
+            transparent: false,
+            opacity: 1.0,
+            emissive: 0x330000,
+            emissiveIntensity: 0.25,
+            roughness: 0.8,
+            metalness: 0.0
+        });
+        
+        const segments = 32;
+        const ringFillGeom = new THREE.RingGeometry(0.0, 1.0, segments);
+        const ringFillMatBase = new THREE.MeshBasicMaterial({
+            color: 0xffff00,
+            transparent: true,
+            opacity: 0.22,
+            side: THREE.DoubleSide,
+            depthWrite: false
+        });
+        const ringEdgeGeom = new THREE.RingGeometry(0.985, 1.0, segments);
+        const ringEdgeMatBase = new THREE.MeshBasicMaterial({
+            color: 0xffff00,
+            transparent: true,
+            opacity: 0.8,
+            side: THREE.DoubleSide,
+            depthWrite: false
+        });
+        
+        for (let i = 0; i < max; i++) {
+            const circleGroup = new THREE.Group();
+            circleGroup.visible = false;
+            this.overlayScene.add(circleGroup);
+            
+            const sphereGroup = new THREE.Group();
+            sphereGroup.visible = false;
+            this.scene.add(sphereGroup);
+            
+            const sphere = new THREE.Mesh(sphereGeom, sphereMatBase.clone());
+            sphereGroup.add(sphere);
+            
+            const circle = new THREE.Mesh(ringFillGeom, ringFillMatBase.clone());
+            circle.rotation.set(0, 0, 0);
+            circleGroup.add(circle);
+            
+            const edges = new THREE.Mesh(ringEdgeGeom, ringEdgeMatBase.clone());
+            edges.rotation.set(0, 0, 0);
+            circleGroup.add(edges);
+            
+            this.impulseIndicators.push({
+                active: false,
+                startMs: 0,
+                endMs: 0,
+                maxStrength: 1.0,
+                radiusWorld: 0.1,
+                dir: new THREE.Vector3(),
+                posWorld: new THREE.Vector3(),
+                circleGroup,
+                sphereGroup,
+                sphere,
+                circle,
+                edges
+            });
+        }
+    }
+    
+    triggerImpulseIndicator(info) {
+        // 使用可能なスロットを探す
+        let slot = -1;
+        for (let i = 0; i < this.impulseIndicators.length; i++) {
+            if (!this.impulseIndicators[i].active) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            // すべて使用中なら最初のスロットを使う
+            slot = 0;
+        }
+        
+        const ind = this.impulseIndicators[slot];
+        if (!ind) return;
+        
+        ind.active = true;
+        ind.startMs = Date.now();
+        ind.endMs = ind.startMs + 400; // 400ms表示
+        ind.maxStrength = Math.max(0.0001, info?.strength ?? 1.0);
+        ind.radiusWorld = (info?.angle ?? 0.5) * (info?.posWorld?.length() ?? 1.0) * 0.3;
+        ind.dir.copy(info?.dir ?? new THREE.Vector3(0, 0, 1));
+        ind.posWorld.copy(info?.posWorld ?? new THREE.Vector3(0, 0, 1));
+        
+        ind.circleGroup.position.copy(ind.posWorld);
+        ind.circleGroup.visible = true;
+        ind.sphereGroup.position.copy(ind.posWorld);
+        ind.sphereGroup.visible = true;
+    }
+    
+    updateImpulseIndicator() {
+        if (this.impulseCtx && this.impulseCanvas) {
+            this.impulseCtx.clearRect(0, 0, this.impulseCanvas.width, this.impulseCanvas.height);
+        }
+        const now = Date.now();
+        const list = this.impulseIndicators || [];
+        if (!list.length) return;
+        
+        for (let i = 0; i < list.length; i++) {
+            const ind = list[i];
+            if (!ind.active) continue;
+            if (now > ind.endMs) {
+                ind.active = false;
+                ind.circleGroup.visible = false;
+                ind.sphereGroup.visible = false;
+                continue;
+            }
+            
+            const total = Math.max(1, ind.endMs - ind.startMs);
+            const t = Math.min(1, Math.max(0, (now - ind.startMs) / total));
+            const alpha = Math.max(0, 1 - t);
+            
+            const strength01 = Math.min(1, Math.max(0, ind.maxStrength / 1.0));
+            
+            const s = 0.75 + strength01 * 0.65;
+            ind.sphere.scale.set(s, s, s);
+            
+            const radiusWorld = ind.radiusWorld * (0.6 + 0.9 * t);
+            ind.circle.scale.set(radiusWorld, radiusWorld, 1);
+            ind.circle.material.opacity = alpha * 0.22;
+            ind.edges.scale.set(radiusWorld, radiusWorld, 1);
+            ind.edges.material.opacity = alpha * 0.8;
+            
+            // Circleを画面（カメラ）に対して平行にする（Scene01と同じ）
+            // カメラの向きに合わせて回転
+            ind.circleGroup.lookAt(ind.circleGroup.position.clone().add(this.camera.getWorldDirection(new THREE.Vector3())));
+            
+            // テキスト表示
+            if (this.impulseCtx && this.impulseCanvas) {
+                const v = ind.posWorld.clone();
+                v.project(this.camera);
+                const x = (v.x * 0.5 + 0.5) * this.impulseCanvas.width;
+                const y = (-v.y * 0.5 + 0.5) * this.impulseCanvas.height;
+                if (x >= 0 && x <= this.impulseCanvas.width && y >= 0 && y <= this.impulseCanvas.height && v.z > -1.0 && v.z < 1.0) {
+                    this.impulseCtx.save();
+                    this.impulseCtx.fillStyle = 'white';
+                    this.impulseCtx.font = '20px monospace';
+                    this.impulseCtx.textAlign = 'center';
+                    this.impulseCtx.textBaseline = 'top';
+                    
+                    const dirText = `Dir: (${ind.dir.x.toFixed(2)}, ${ind.dir.y.toFixed(2)}, ${ind.dir.z.toFixed(2)})`;
+                    const strengthText = `Strength: ${ind.maxStrength.toFixed(2)}`;
+                    const radiusText = `Radius: ${ind.radiusWorld.toFixed(2)}`;
+                    
+                    this.impulseCtx.globalAlpha = alpha;
+                    this.impulseCtx.fillText(dirText, x, y);
+                    this.impulseCtx.fillText(strengthText, x, y + 24);
+                    this.impulseCtx.fillText(radiusText, x, y + 48);
+                    this.impulseCtx.restore();
+                }
+            }
+        }
+    }
+
     switchCameraRandom() {
+        if (!this.trackEffects[1]) return;
+        if (!this.cameraParticles?.length) return;
+        let newIndex = this.currentCameraIndex;
+        while (newIndex === this.currentCameraIndex) {
+            newIndex = Math.floor(Math.random() * this.cameraParticles.length);
+        }
+        this.currentCameraIndex = newIndex;
+    }
+    
+    /**
+     * カメラモードの初期設定（削除予定 - CameraParticle.setupCameraModeを使用）
+     */
+    _setupCameraMode_OLD(cp, mode, rMax, boxMin, boxMax) {
+        cp.boxMin = boxMin.clone();
+        cp.boxMax = boxMax.clone();
+        
+        // カメラモードを設定（重要！これがないと_updateCameraModeで判定できない）
+        cp.cameraMode = mode;
+        
+        switch (mode) {
+            case 0: // ① フロント・ワイド（基準視点）
+                cp.maxSpeed = 0.01; // ほぼ固定
+                cp.maxForce = 0.005;
+                cp.friction = conf.cameraNoDamping ? 0.0 : 0.05; // 強めの減衰
+                cp.position.set(0, 0, rMax * 4.5); // もっと引く（3.75 → 4.5）
+                cp.desired = cp.position.clone();
+                cp.modeName = 'frontWide';
+                break;
+                
+            case 1: // ② フロント・ミディアム
+                cp.maxSpeed = 0.03; // 微ドリフト
+                cp.maxForce = 0.01;
+                cp.friction = conf.cameraNoDamping ? 0.0 : (conf.cameraFriction ?? 0.02);
+                cp.position.set(0, 0, rMax * 2.0); // 少し近い
+                cp.desired = cp.position.clone();
+                cp.modeName = 'frontMedium';
+                break;
+                
+            case 2: // ③ クローズアップ
+                cp.maxSpeed = 0.05;
+                cp.maxForce = 0.02;
+                cp.friction = conf.cameraNoDamping ? 0.0 : (conf.cameraFriction ?? 0.02);
+                // ランダムな方向に近づく（もっと近く）
+                const closeupDir = new THREE.Vector3(
+                    (Math.random() - 0.5) * 1.0, // 0.5 → 1.0 に変更（注視点をよりランダムに）
+                    (Math.random() - 0.5) * 1.0, // 0.5 → 1.0 に変更（注視点をよりランダムに）
+                    1
+                ).normalize();
+                cp.position.copy(closeupDir.multiplyScalar(rMax * 0.5)); // 0.8 → 0.5 に変更（もっと近く）
+                cp.desired = cp.position.clone();
+                cp.modeName = 'closeup';
+                break;
+                
+            case 3: // ④ サイド・パン
+                cp.maxSpeed = 0.12;
+                cp.maxForce = 0.08;
+                cp.friction = conf.cameraNoDamping ? 0.0 : (conf.cameraFriction ?? 0.02);
+                // 切り替わった時にランダムで右か左に方向を決める
+                this.cameraModeState.sidePanDirection = Math.random() > 0.5 ? 1 : -1;
+                // 初期位置は中央付近
+                cp.position.set(0, 0, rMax * 2.4);
+                cp.desired = cp.position.clone();
+                cp.modeName = 'sidePan';
+                // 切替時フラグをリセット
+                cp._sidePanInitialized = false;
+                break;
+                
+            case 4: // ⑤ オフセンター固定
+                cp.maxSpeed = 0.01;
+                cp.maxForce = 0.005;
+                cp.friction = conf.cameraNoDamping ? 0.0 : 0.05;
+                // オフセットを適用した位置に配置
+                const offCenterX = this.cameraModeState.offCenterOffset.x * rMax * 2.0;
+                const offCenterY = this.cameraModeState.offCenterOffset.y * rMax * 2.0;
+                cp.position.set(offCenterX, offCenterY, rMax * 2.4);
+                cp.desired = cp.position.clone();
+                cp.modeName = 'offCenter';
+                break;
+                
+            case 5: // ⑥ スロー・オービット（球面座標系で動く）
+                cp.maxSpeed = 0.15;
+                cp.maxForce = 0.08;
+                cp.friction = conf.cameraNoDamping ? 0.0 : (conf.cameraFriction ?? 0.02);
+                
+                // 球面座標系の初期化
+                // 経度（longitude）: 0～360° をランダムに開始
+                this.cameraModeState.orbitLongitude = Math.random() * Math.PI * 2; // 0～2π
+                // 緯度（latitude）: 固定（180°固定 = 赤道を通る）+ ランダム角度
+                this.cameraModeState.orbitLatitudeBase = Math.PI; // 180° (赤道)
+                this.cameraModeState.orbitLatitudeOffset = (Math.random() - 0.5) * Math.PI; // ±90°のランダム角度
+                
+                const rMax_orbit_init = Math.max(0.2, (Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0) + Number(this.particleSystem?.uniforms?.heightAmp?.value ?? 0.03)));
+                const orbitRadius_init = rMax_orbit_init * 2.8; // 球体より少し大きめ
+                
+                // 球面座標から3D座標に変換
+                const lon = this.cameraModeState.orbitLongitude;
+                const lat = this.cameraModeState.orbitLatitudeBase + this.cameraModeState.orbitLatitudeOffset;
+                
+                cp.position.set(
+                    orbitRadius_init * Math.sin(lat) * Math.cos(lon), // X
+                    orbitRadius_init * Math.cos(lat),                  // Y
+                    orbitRadius_init * Math.sin(lat) * Math.sin(lon)  // Z
+                );
+                cp.desired = cp.position.clone();
+                cp.modeName = 'slowOrbit';
+                // boxの制限を解除（範囲関係なく周回）
+                cp.boxMin = null;
+                cp.boxMax = null;
+                break;
+                
+            case 6: // ⑦ フォロー（Track5の注視点を追う）
+                cp.maxSpeed = 0.06;
+                cp.maxForce = 0.025;
+                cp.friction = conf.cameraNoDamping ? 0.0 : (conf.cameraFriction ?? 0.02);
+                cp.position.set(0, 0, rMax * 2.2);
+                cp.desired = cp.position.clone();
+                // Track5の最新の圧力位置を記録
+                cp._followTarget = new THREE.Vector3(0, 0, 0);
+                // 滑らかな注視点（補間用）
+                cp._smoothLookAtTarget = new THREE.Vector3(0, 0, 0);
+                cp.modeName = 'follow';
+                break;
+                
+            case 7: // ⑧ 静止ショット
+                cp.maxSpeed = 0.005; // 最小限
+                cp.maxForce = 0.002;
+                cp.friction = conf.cameraNoDamping ? 0.0 : 0.08; // 強めの減衰
+                cp.position.set(0, 0, rMax * 2.5);
+                cp.desired = cp.position.clone();
+                cp.modeName = 'still';
+                break;
+        }
+    }
+    
+    /**
+     * カメラモード別の更新処理（削除予定 - CameraParticle.updateCameraModeを使用）
+     */
+    _updateCameraMode_OLD(cp, deltaTime) {
+        if (cp.cameraMode === undefined) return;
+
+        switch (cp.cameraMode) {
+            case 0: // ① フロント・ワイド - ほぼ固定
+                // desiredを現在位置に固定
+                cp.desired.copy(cp.position);
+                break;
+                
+            case 1: // ② フロント・ミディアム - 微ドリフト
+                // desiredを少しだけ動かす
+                const drift = new THREE.Vector3(
+                    (Math.random() - 0.5) * 0.01,
+                    (Math.random() - 0.5) * 0.01,
+                    0
+                );
+                cp.desired.add(drift);
+                break;
+                
+            case 2: // ③ クローズアップ - ランダムに近づく（もっと近く）
+                // 時々新しい近接位置を設定
+                if (Math.random() < 0.01) {
+                    const closeupDir = new THREE.Vector3(
+                        (Math.random() - 0.5) * 1.0, // 0.5 → 1.0 に変更（注視点をよりランダムに）
+                        (Math.random() - 0.5) * 1.0, // 0.5 → 1.0 に変更（注視点をよりランダムに）
+                        1
+                    ).normalize();
+                    const baseR = Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0);
+                    cp.desired.copy(closeupDir.multiplyScalar(baseR * 0.5)); // 0.8 → 0.5 に変更（もっと近く）
+                }
+                break;
+                
+            case 3: // ④ サイド・パン - 切替時のみ力を加える（物理演算で動く）
+                // 切替時のみ力を加える（_updateCameraModeは毎フレーム呼ばれるので、フラグで管理）
+                if (!cp._sidePanInitialized) {
+                    const panDir = this.cameraModeState.sidePanDirection;
+                    const panForce = 0.01; // 力をもっと弱く（0.05 → 0.01）
+                    
+                    // 右か左に力を加える（切替時のみ）
+                    cp.force.x = panDir * panForce;
+                    cp.force.y = 0;
+                    cp.force.z = 0;
+                    
+                    cp._sidePanInitialized = true;
+                }
+                
+                // 範囲を超えたら方向を反転（境界でバウンド）
+                const rMax_pan = Math.max(0.2, (Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0) + Number(this.particleSystem?.uniforms?.heightAmp?.value ?? 0.03)));
+                const panLimit = rMax_pan * 3.0;
+                
+                if (Math.abs(cp.position.x) > panLimit) {
+                    this.cameraModeState.sidePanDirection *= -1;
+                }
+                break;
+                
+            case 4: // ⑤ オフセンター固定 - 固定（位置を維持）
+                // オフセット位置を維持
+                const offCenterX = this.cameraModeState.offCenterOffset.x * (Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0) * 2.0);
+                const offCenterY = this.cameraModeState.offCenterOffset.y * (Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0) * 2.0);
+                const rMax_update = Math.max(0.2, (Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0) + Number(this.particleSystem?.uniforms?.heightAmp?.value ?? 0.03)));
+                cp.desired.set(offCenterX, offCenterY, rMax_update * 2.4);
+                break;
+                
+            case 5: // ⑥ スロー・オービット - 球面座標系で円周に沿って動く
+                // 経度を連続的に更新（0～360°をループ）
+                this.cameraModeState.orbitLongitude += this.cameraModeState.orbitSpeed * deltaTime * 60;
+                // 角度を0～2πの範囲に正規化
+                while (this.cameraModeState.orbitLongitude >= Math.PI * 2) {
+                    this.cameraModeState.orbitLongitude -= Math.PI * 2;
+                }
+                
+                const lon = this.cameraModeState.orbitLongitude;
+                const lat = this.cameraModeState.orbitLatitudeBase + this.cameraModeState.orbitLatitudeOffset;
+                
+                // 半径を動的に更新（パーティクルシステムのサイズに合わせる）
+                const rMax_orbit = Math.max(0.2, (Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.0) + Number(this.particleSystem?.uniforms?.heightAmp?.value ?? 0.03)));
+                const radius = rMax_orbit * 2.8;
+                
+                // 球面座標から3D座標に変換（目標位置）
+                const targetX = radius * Math.sin(lat) * Math.cos(lon);
+                const targetY = radius * Math.cos(lat);
+                const targetZ = radius * Math.sin(lat) * Math.sin(lon);
+                
+                // 現在位置から目標位置への方向ベクトル
+                const toTargetX = targetX - cp.position.x;
+                const toTargetY = targetY - cp.position.y;
+                const toTargetZ = targetZ - cp.position.z;
+                const distance = Math.sqrt(toTargetX * toTargetX + toTargetY * toTargetY + toTargetZ * toTargetZ);
+                
+                // 球面に沿うように力を加える（求心力）
+                if (distance > 0.001) {
+                    const seekForce = 0.08; // 目標位置に向かう力
+                    cp.force.x = (toTargetX / distance) * seekForce;
+                    cp.force.y = (toTargetY / distance) * seekForce;
+                    cp.force.z = (toTargetZ / distance) * seekForce;
+                } else {
+                    cp.force.set(0, 0, 0);
+                }
+                break;
+                
+            case 6: // ⑦ フォロー - Track5の注視点を追う（滑らかな連続移動）
+                // Track5の最新の圧力位置を追う（滑らかに補間）
+                if (cp._followTarget && cp._smoothLookAtTarget) {
+                    // 注視点を滑らかに補間（カメラを回すような連続した動き）
+                    const lookAtLerp = 0.08; // 補間係数（大きいほど速く追う）
+                    cp._smoothLookAtTarget.lerp(cp._followTarget, lookAtLerp);
+                    
+                    // カメラ位置も滑らかに追う
+                    const toTarget = cp._followTarget.clone().sub(cp.desired);
+                    const distance = toTarget.length();
+                    
+                    // 距離に応じて追従速度を変える（遠い時は速く、近い時は遅く）
+                    let followSpeed = 0.0;
+                    if (distance > 0.5) {
+                        // 遠い時：やや速めに追う
+                        followSpeed = 0.015;
+                    } else if (distance > 0.2) {
+                        // 中距離：普通の速度
+                        followSpeed = 0.008;
+                    } else {
+                        // 近い時：ゆっくり追う（微調整）
+                        followSpeed = 0.003;
+                    }
+                    
+                    // 最大速度制限（人間らしい動きの上限）
+                    const maxStep = 0.02 * deltaTime * 60; // フレームレートに依存しない最大ステップ
+                    const step = Math.min(distance * followSpeed, maxStep);
+                    
+                    if (distance > 0.001) { // 閾値以下は追わない（微細な揺れを防ぐ）
+                        toTarget.normalize().multiplyScalar(step);
+                        cp.desired.add(toTarget);
+                    }
+                }
+                break;
+                
+            case 7: // ⑧ 静止ショット - ほぼ動かない
+                cp.desired.copy(cp.position);
+                break;
+        }
+    }
+    
+    /**
+     * モード別のカメラ位置を取得
+     */
+    _getCameraPositionForMode(cp) {
+        // 全てのモードで cp.position を使う（パーティクルとして動くため）
+        const basePos = cp.position.clone().add(this.cameraCenter);
+        
+        // モードによって位置を調整
+        if (cp.cameraMode === 4) { // オフセンター固定
+            // オフセットを適用
+            return basePos.add(this.cameraModeState.offCenterOffset.clone().multiplyScalar(0.5));
+        }
+        
+        return basePos;
+    }
+    
+    /**
+     * モード別のlookAtターゲットを取得
+     */
+    _getLookAtTargetForMode(cp) {
+        // クローズアップの場合は、ランダムな注視点
+        if (cp.cameraMode === 2) { // CameraMode.CLOSEUP
+            if (cp.modeState.lookAtTarget) {
+                return cp.modeState.lookAtTarget.clone();
+            }
+        }
+        
+        // オフセンターの場合は、ランダムな注視点
+        if (cp.cameraMode === 4) { // CameraMode.OFF_CENTER
+            if (cp.modeState.lookAtTarget) {
+                return cp.modeState.lookAtTarget.clone();
+            }
+        }
+        
+        // フォローの場合は、Track5の注視点を見る（滑らかな補間位置）
+        if (cp.cameraMode === 6) { // CameraMode.FOLLOW
+            if (cp._smoothLookAtTarget) {
+                return cp._smoothLookAtTarget.clone();
+            }
+        }
+        
+        return this.cameraCenter.clone();
+    }
+
+    onBarChange(prevBar, nextBar) {
+        // 2小節に1回、カメラモードをランダマイズ
+        if (!this.cameraParticles?.length) return;
+        
+        // 2小節に1回のみ実行（奇数小節のみ）
+        if (nextBar % 2 === 0) return;
+        
+        // 現在のカメラインデックスとは異なるインデックスをランダムに選択
         let newIndex = this.currentCameraIndex;
         while (newIndex === this.currentCameraIndex) {
             newIndex = Math.floor(Math.random() * this.cameraParticles.length);
         }
         this.currentCameraIndex = newIndex;
         
-        if (this.cameraParticles[this.currentCameraIndex]) {
-            this.cameraParticles[this.currentCameraIndex].applyRandomForce();
-        }
+        // デバッグ用：モード名を表示
+        const cp = this.cameraParticles[newIndex];
+    }
+    
+    applyTrack2Invert(velocity, durationMs) {
+        if (!this.trackEffects[2]) return;
+        const dur = durationMs > 0 ? durationMs : 150;
+        this.setInvert(true, dur);
+    }
+    
+    applyTrack3Chromatic(velocity, durationMs) {
+        if (!this.trackEffects[3]) return;
+        const amount = Math.min(Math.max(velocity / 127, 0), 1) * 1.0;
+        const dur = durationMs > 0 ? durationMs : 150;
+        this.setChromatic(amount, dur);
+    }
+    
+    applyTrack4Glitch(velocity, durationMs) {
+        if (!this.trackEffects[4]) return;
+        const amount = Math.min(Math.max(velocity / 127, 0), 1) * 0.7;
+        const dur = durationMs > 0 ? durationMs : 150;
+        this.setGlitch(amount, dur);
     }
     
     /**
-     * 赤いsphereを発生
+     * actual_tickに応じてLFOの深さと周期を段々早めていく
+     * - tickが進むほど、LFOのrate範囲を早くする（周期を短くする）
+     * - tickが進むほど、LFOのvalue範囲を広げる（深さを大きくする）
      */
-    createRedSphere(velocity) {
-        const currentTime = Date.now();
-        const timeDiff = currentTime - this.lastSphereTime;
+    applyTickEffects(tick) {
+        if (!this.yureLFO || !this._lfoInitialParams) return;
         
-        // 位置を決定
-        let position;
-        let isFirstAfterInterval = false;  // 暫く間があいた後の最初のsphereかどうか
+        // tickを0..1に正規化
+        const maxTicks = this._tickMaxTicks || 38400;
+        const tickNormalized = Math.min(Math.max(Number(tick) / maxTicks, 0), 1);
         
-        if (this.lastSpherePosition) {
-            // 前回の位置がある場合、時間間隔に応じて距離を決定
-            // 間が開けば開くほど遠くに、近ければ近いほど近い位置でランダム
-            // timeDiffが小さい（近い）→ 近い範囲でランダム
-            // timeDiffが大きい（遠い）→ 遠い範囲でランダム
-            const minTimeDiff = 0;      // 最小時間間隔（ms）
-            const maxTimeDiff = 5000;   // 最大時間間隔（ms、これ以上は完全ランダム）
-            const minDistance = 50.0;   // 最小距離（近い時）
-            const maxDistance = 1000.0; // 最大距離（遠い時）
+        // tickが進むほど変化量を大きくする（0..1の範囲で）
+        // 例: tickNormalized = 0 → 変化なし、tickNormalized = 1 → 最大変化
+        
+        // 各LFOに対して適用
+        const lfos = ['noiseScale', 'heightAmp', 'noiseSpeed'];
+        
+        lfos.forEach((key) => {
+            const lfo = this.yureLFO[key];
+            if (!lfo) return;
             
-            let distance;
-            if (timeDiff <= minTimeDiff) {
-                // 時間間隔が0または負の場合は最小距離
-                distance = minDistance;
-            } else if (timeDiff >= maxTimeDiff) {
-                // 時間間隔が最大値を超えた場合は完全ランダム
-                position = new THREE.Vector3(
-                    (Math.random() - 0.5) * 2000,
-                    (Math.random() - 0.5) * 2000,
-                    (Math.random() - 0.5) * 2000
-                );
-                isFirstAfterInterval = true;
-            } else {
-                // 時間間隔に応じて距離を線形補間
-                const distanceFactor = THREE.MathUtils.mapLinear(timeDiff, minTimeDiff, maxTimeDiff, 0.0, 1.0);
-                distance = THREE.MathUtils.lerp(minDistance, maxDistance, distanceFactor);
-                
-                // 前回の位置から指定距離内でランダムに配置
-                // 球面上のランダムな方向を生成
-                const theta = Math.random() * Math.PI * 2; // 方位角
-                const phi = Math.acos(2 * Math.random() - 1); // 極角
-                const randomDistance = Math.random() * distance; // 距離もランダムに
-                
-                const direction = new THREE.Vector3(
-                    Math.sin(phi) * Math.cos(theta),
-                    Math.sin(phi) * Math.sin(theta),
-                    Math.cos(phi)
-                );
-                
-                position = this.lastSpherePosition.clone().add(direction.multiplyScalar(randomDistance));
-            }
+            const initial = this._lfoInitialParams[key];
+            if (!initial) return;
             
-            // 位置がまだ設定されていない場合（timeDiffがmaxTimeDiff未満の場合）
-            if (!position) {
-                // これは上記のelseブロックで既に設定されているはずだが、念のため
-                const distanceFactor = THREE.MathUtils.mapLinear(timeDiff, minTimeDiff, maxTimeDiff, 0.0, 1.0);
-                distance = THREE.MathUtils.lerp(minDistance, maxDistance, distanceFactor);
-                
-                const theta = Math.random() * Math.PI * 2;
-                const phi = Math.acos(2 * Math.random() - 1);
-                const randomDistance = Math.random() * distance;
-                
-                const direction = new THREE.Vector3(
-                    Math.sin(phi) * Math.cos(theta),
-                    Math.sin(phi) * Math.sin(theta),
-                    Math.cos(phi)
-                );
-                
-                position = this.lastSpherePosition.clone().add(direction.multiplyScalar(randomDistance));
-            }
-        } else {
-            // 前回の位置がない場合（最初のsphere）は完全ランダム
-            position = new THREE.Vector3(
-                (Math.random() - 0.5) * 1000,
-                (Math.random() - 0.5) * 1000,
-                (Math.random() - 0.5) * 1000
-            );
-            isFirstAfterInterval = true;
-        }
-        
-        // ベロシティをHSLに変換（0-127 → 青(240度)から赤(0度)へ）
-        let hue = THREE.MathUtils.mapLinear(velocity, 0, 127, 240, 0);
-        if (hue < 0) hue += 360;  // 負の値の場合は360度を加算（Processingと同じ）
-        // 鮮やかな赤にするため、彩度と明度を調整
-        const saturation = 100.0;  // 彩度100%（最大鮮やかに）
-        const lightness = 50.0;   // 明度50%（濃い赤）
-        
-        // デバッグ用ログ（ベロシティと色の対応を確認）
-        console.log(`createRedSphere - velocity: ${velocity}, hue: ${hue}, saturation: ${saturation}, lightness: ${lightness}`);
-        
-        // 赤いsphereを作成（DOFエフェクト用にカメラを渡す）
-        const redSphere = new Scene02_RedSphere(position, hue, saturation, lightness, this.scene, this.sphereGroup, this.useShaderRendering, this.sphereMaterial, this.camera);
-        redSphere.createThreeObjects();
-        this.redSpheres.push(redSphere);
-        
-        // sphere数が300を超えたら、次のトラック2でリセットするフラグを立てる
-        if (this.redSpheres.length > 300) {
-            this.shouldResetOnTrack2 = true;
-            console.log(`Sphere count exceeded 300 (${this.redSpheres.length}), will reset on next Track 2`);
-        }
-        
-        // 暫く間があいた後の最初のsphereの場合のみスコープを追加
-        if (isFirstAfterInterval && this.SHOW_SCOPES) {
-            const scope = new Scene02_Scope(position, this.renderer, this.camera);
-            scope.createThreeObjects(this.scene);
-            this.activeScopes.push(scope);
-        }
-        
-        // 前回の位置とタイムを更新
-        this.lastSpherePosition = position.clone();
-        this.lastSphereTime = currentTime;
-        
-        // 黄色いsphereを周りに発生 - コメントアウト
-        // this.createYellowSpheres(position);
-        
-        // 接続をチェック（トラック5が押されている間はスキップしてパフォーマンス向上）
-        if (!this.key5Pressed) {
-        this.checkNewConnections(redSphere);
-    }
+            // 1. rate範囲を早くする（周期を短くする）
+            // tickNormalized = 0 → 初期値、tickNormalized = 1 → 3倍速
+            const rateMultiplier = 1.0 + tickNormalized * 2.0; // 1.0倍 → 3.0倍
+            const newMinRate = initial.minRate * rateMultiplier;
+            const newMaxRate = initial.maxRate * rateMultiplier;
+            lfo.setRateRange(newMinRate, newMaxRate);
+            
+            // 2. value範囲を広げる（深さを大きくする）
+            // tickNormalized = 0 → 初期値、tickNormalized = 1 → 1.5倍の範囲
+            const valueRange = initial.maxValue - initial.minValue;
+            const centerValue = (initial.minValue + initial.maxValue) / 2.0;
+            const rangeMultiplier = 1.0 + tickNormalized * 0.5; // 1.0倍 → 1.5倍
+            const newRange = valueRange * rangeMultiplier;
+            const newMinValue = centerValue - newRange / 2.0;
+            const newMaxValue = centerValue + newRange / 2.0;
+            lfo.setValueRange(newMinValue, newMaxValue);
+        });
     }
     
-    /**
-     * 黄色いsphereを発生（赤いsphereと同じ位置で1つだけ）- コメントアウト
-     */
-    // createYellowSpheres(center) {
-    //     const yellowSphere = new Scene02_YellowSphere(center, this.scene, this.sphereGroup, this.useShaderRendering, this.sphereMaterial);
-    //     yellowSphere.createThreeObjects();
-    //     this.yellowSpheres.push(yellowSphere);
-    // }
+    toggleEffect(trackNumber) {
+        super.toggleEffect(trackNumber);
+    }
     
-    /**
-     * 接続を更新
-     */
-    updateConnections() {
-        this.connections = [];
-        
-        for (let i = 0; i < this.redSpheres.length; i++) {
-            const fromSphere = this.redSpheres[i];
-            
-            for (let j = i + 1; j < this.redSpheres.length; j++) {
-                const toSphere = this.redSpheres[j];
-                const dist = fromSphere.getPosition().distanceTo(toSphere.getPosition());
-                
-                if (dist < this.NEIGHBOR_DISTANCE) {
-                    this.connections.push(new Scene02_Connection(fromSphere, toSphere));
-                }
+    // 共通エフェクト制御
+    // setInvert / setChromatic / setGlitch は SceneBase に共通化
+
+    handleKeyPress(key) {
+        // 共通キーはSceneBaseで処理（c/Cなど）
+        if (super.handleKeyPress && super.handleKeyPress(key)) return;
+        if (key === 'g' || key === 'G') this.SHOW_WORLD_GRID = !this.SHOW_WORLD_GRID;
+        if (key === 'p' || key === 'P') this.SHOW_PARTICLES = !this.SHOW_PARTICLES;
+        // u/U: パーティクル更新方式（切り分け用）
+        // - フル更新(毎フレ全粒) ⇄ 半分更新(偶数/奇数を交互)
+        if (key === 'u' || key === 'U') {
+            if (this.particleSystem) {
+                this.particleSystem.updateStride = (this.particleSystem.updateStride >= 2) ? 1 : 2;
             }
         }
-    }
-    
-    /**
-     * 新しい接続をチェック
-     */
-    checkNewConnections(newSphere) {
-        let hasNewConnection = false;
-        
-        for (let i = 0; i < this.redSpheres.length; i++) {
-            const otherSphere = this.redSpheres[i];
-            if (otherSphere === newSphere) continue;
-            
-            const dist = newSphere.getPosition().distanceTo(otherSphere.getPosition());
-            
-            if (dist < this.NEIGHBOR_DISTANCE) {
-                hasNewConnection = true;
-                // スコープは暫く間があいた後の最初のsphereのみに表示するため、ここでは追加しない
-                break;
+        // n/N: 球体マッピングじゃないノイズ（dirを流す）ON/OFF
+        if (key === 'n' || key === 'N') {
+            this.ENABLE_FLOW_ON_SPHERE = !this.ENABLE_FLOW_ON_SPHERE;
+            if (this.particleSystem?.uniforms?.flowOnSphereEnabled) {
+                this.particleSystem.uniforms.flowOnSphereEnabled.value = this.ENABLE_FLOW_ON_SPHERE ? 1.0 : 0.0;
             }
         }
-    }
-    
-    /**
-     * OSCメッセージのハンドリング（SceneBaseをオーバーライド）
-     */
-    handleOSC(message) {
-        const trackNumber = message.trackNumber;
-        
-        // トラック2: 色反転エフェクトの処理後にリセットチェック
-        if (trackNumber === 2) {
-            // 親クラスのhandleOSCを呼ぶ（色反転エフェクトの処理）
-            super.handleOSC(message);
-            
-            // sphere数が300を超えていたらリセット
-            if (this.shouldResetOnTrack2) {
-                this.shouldResetOnTrack2 = false;
-                console.log('Track 2: Resetting due to sphere count exceeding 300');
-                this.reset();
+        // m/M: 圧力モード <-> LFOモード切替
+        if (key === 'm' || key === 'M') {
+            this.ENABLE_PRESSURE = !this.ENABLE_PRESSURE;
+            this.ENABLE_YURE_LFO = !this.ENABLE_PRESSURE;
+            if (this.particleSystem?.setPressureModeEnabled) {
+                this.particleSystem.setPressureModeEnabled(!!this.ENABLE_PRESSURE);
+            }
         }
-            return;  // 処理済み
-        }
-        
-        // その他は親クラスの処理を呼ぶ
-        super.handleOSC(message);
+        if (this.particleSystem?.object) this.particleSystem.object.visible = !!this.SHOW_PARTICLES;
+        if (this.particleSystem) this.particleSystem.computeEnabled = !!this.SHOW_PARTICLES;
     }
+
+    // NOTE: 塗りは撤去（ユーザー要望）
     
-    /**
-     * OSCメッセージの処理
-     */
-    handleTrackNumber(trackNumber, message) {
-        const args = message.args || [];
-        
-        // トラック1、2はSceneBaseで共通処理されているため、ここでは処理しない
-        // if (trackNumber === 1) {
-        //     this.switchCameraRandom();
-        // }
-        // if (trackNumber === 2) {
-        //     // SceneBaseで色反転エフェクトを処理
-        // }
-        
-        // トラック5: 赤いsphereを発生（サステイン開始）
-        if (trackNumber === 5) {
-            const noteNumber = args[0] || 64.0;  // ノート（MIDI）
-            const velocity = args[1] || 127.0;  // ベロシティ（0-127）
-            const durationMs = args[2] || 0.0;  // デュレーション（ms）
-            console.log(`handleTrackNumber - trackNumber: ${trackNumber}, note: ${noteNumber}, velocity: ${velocity}, duration: ${durationMs}`);
-            
-            this.handleTrack5(velocity);
-        }
-    }
-    
-    /**
-     * キーダウン処理（トラック5専用：接続チェックをスキップ）
-     */
-    handleKeyDown(trackNumber) {
-        // 親クラスのhandleKeyDownを呼ぶ（トラック2の色反転など）
-        super.handleKeyDown(trackNumber);
-        
-        // トラック5: 接続チェックをスキップするためフラグを設定
-        if (trackNumber === 5) {
-            this.key5Pressed = true;
-            console.log('Track 5: Connection check disabled');
-        }
-    }
-    
-    /**
-     * キーアップ処理（トラック5専用：接続チェックを再開）
-     */
-    handleKeyUp(trackNumber) {
-        // 親クラスのhandleKeyUpを呼ぶ（トラック2の色反転など）
-        super.handleKeyUp(trackNumber);
-        
-        // トラック5: 接続チェックを再開
-        if (trackNumber === 5) {
-            this.key5Pressed = false;
-            console.log('Track 5: Connection check enabled');
-            
-            // キーが離された時に、既存のsphereの接続を再チェック
-            this.redSpheres.forEach(sphere => {
-                this.checkNewConnections(sphere);
-            });
-        }
-    }
-    
-    /**
-     * トラック5の処理（サステイン開始）
-     */
-    handleTrack5(velocity = 127.0) {
-        this.key5Pressed = true;
-        this.createRedSphere(velocity);
-        
-        // 生成されたsphereを記録
-        if (this.redSpheres.length > 0) {
-            this.growingSphere = this.redSpheres[this.redSpheres.length - 1];
-            this.growingSphereScale = 1.0;
-        }
-        
-        console.log('Track 5: Red sphere created');
-    }
-    
-    /**
-     * 5キーの状態を設定
-     */
-    setKey5Pressed(pressed) {
-        this.key5Pressed = pressed;
-    }
-    
-    /**
-     * リセット処理（Rキーで呼ばれる）
-     */
     reset() {
-        super.reset(); // TIMEをリセット
-        // すべてのsphereをクリア
-        this.redSpheres.forEach(sphere => sphere.dispose(this.scene));
-        // this.yellowSpheres.forEach(sphere => sphere.dispose(this.scene));  // 黄色いsphereをコメントアウト
-        this.redSpheres = [];
-        // this.yellowSpheres = [];  // 黄色いsphereをコメントアウト
-        this.connections = [];
+        super.reset();
         
-        // スコープをクリア
-        this.activeScopes.forEach(scope => scope.dispose(this.scene));
-        this.activeScopes = [];
+        // エフェクトOFF
+        this.setInvert(false, 0);
+        this.setChromatic(0.0, 0);
+        this.setGlitch(0.0, 0);
         
-        // 状態をリセット
-        this.key5Pressed = false;
-        this.growingSphere = null;
-        this.growingSphereScale = 1.0;
-        this.lastSpherePosition = null;
-        this.lastSphereTime = 0;
-        this.backgroundWhite = false;
-        this.backgroundWhiteEndTime = 0;
-        this.laserScanActive = false;
-        this.scanY = this.scanStartY;
-        
-        // すべてのカメラパーティクルをリセット
-        this.cameraParticles.forEach(cp => cp.reset());
-        this.currentCameraIndex = 0;
-        
-        // グループをクリア
-        this.sphereGroup.clear();
-        this.lineGroup.clear();
-        this.laserScanGroup.clear();
-        
-        // スコープ用の共有Canvasをクリア
-        if (this.scopeCtx && this.scopeCanvas) {
-            this.scopeCtx.clearRect(0, 0, this.scopeCanvas.width, this.scopeCanvas.height);
+        // カメラをデフォルトへ
+        if (this.controls) {
+            this.controls.target.set(0, 0, 0);
+        }
+        this.camera.position.set(0, 0, 2);
+        if (this.controls) {
+            this.camera.lookAt(this.controls.target);
         }
         
-        console.log('Scene02 reset');
+        // パーティクルをリセット
+        if (this.particleSystem?.reset) {
+            this.particleSystem.reset();
+        }
+
+        // 表示トグルも初期値へ
+        this.SHOW_PARTICLES = true;
+        if (this.particleSystem?.object) this.particleSystem.object.visible = true;
+        if (this.particleSystem) this.particleSystem.computeEnabled = true;
+
+        // Track5 圧力をリセット
+        const u = this.particleSystem?.uniforms;
+        if (u?.pressureStrength) u.pressureStrength.value = 0.0;
+        this._lastPressureMs = 0;
+        this._lastPressureDir = null;
+        this._lastFollowTargetUpdateMs = 0;
+        
+        // Track5インパルス表示をリセット
+        if (this.impulseIndicators) {
+            this.impulseIndicators.forEach((ind) => {
+                if (ind.circleGroup) ind.circleGroup.visible = false;
+                if (ind.sphereGroup) ind.sphereGroup.visible = false;
+                ind.active = false;
+            });
+        }
+        
     }
     
-    /**
-     * リサイズ処理
-     */
     onResize() {
-        // 親クラスのonResizeを呼ぶ（スクリーンショット用Canvasのリサイズ）
         super.onResize();
-        
-        // スコープ用の共有Canvasをリサイズ
-        if (this.scopeCanvas) {
-            this.scopeCanvas.width = window.innerWidth;
-            this.scopeCanvas.height = window.innerHeight;
+        if (this.camera) {
+            this.camera.aspect = window.innerWidth / window.innerHeight;
+            this.camera.updateProjectionMatrix();
         }
     }
     
-    /**
-     * クリーンアップ処理（シーン切り替え時に呼ばれる）
-     */
     dispose() {
-        console.log('Scene02.dispose: クリーンアップ開始');
-        
-        // すべてのsphereを破棄
-        this.redSpheres.forEach(sphere => {
-            if (sphere.dispose) {
-                sphere.dispose(this.scene);
-            }
-        });
-        this.redSpheres = [];
-        
-        // 接続をクリア
-        this.connections = [];
-        
-        // スコープを破棄
-        this.activeScopes.forEach(scope => {
-            if (scope.dispose) {
-                scope.dispose(this.scene);
-            }
-        });
-        this.activeScopes = [];
-        
-        // グループをクリア
-        if (this.sphereGroup) {
-            this.sphereGroup.clear();
-            this.scene.remove(this.sphereGroup);
-            this.sphereGroup = null;
-        }
-        if (this.lineGroup) {
-            this.lineGroup.children.forEach(line => {
-                if (line.geometry) line.geometry.dispose();
-                if (line.material) line.material.dispose();
-            });
-            this.lineGroup.clear();
-            this.scene.remove(this.lineGroup);
-            this.lineGroup = null;
-        }
-        if (this.laserScanGroup) {
-            this.laserScanGroup.children.forEach(obj => {
-                if (obj.geometry) obj.geometry.dispose();
-                if (obj.material) obj.material.dispose();
-            });
-            this.laserScanGroup.clear();
-            this.scene.remove(this.laserScanGroup);
-            this.laserScanGroup = null;
+        // ポストプロセッシングを破棄
+        if (this.postProcessing) {
+            this.postProcessing.dispose();
         }
         
-        // スコープ用Canvasを削除
-        if (this.scopeCanvas && this.scopeCanvas.parentElement) {
-            this.scopeCanvas.parentElement.removeChild(this.scopeCanvas);
-            this.scopeCanvas = null;
-            this.scopeCtx = null;
+        // Track5インパルス表示用Canvasを削除
+        if (this.impulseCanvas && this.impulseCanvas.parentNode) {
+            this.impulseCanvas.parentNode.removeChild(this.impulseCanvas);
         }
         
-        // シェーダーマテリアルを破棄
-        if (this.sphereMaterial) {
-            this.sphereMaterial.dispose();
-            this.sphereMaterial = null;
-        }
-        if (this.lineMaterial) {
-            this.lineMaterial.dispose();
-            this.lineMaterial = null;
-        }
-        
-        // すべてのライトを削除
-        const lightsToRemove = [];
-        this.scene.traverse((object) => {
-            if (object instanceof THREE.Light) {
-                lightsToRemove.push(object);
-            }
-        });
-        lightsToRemove.forEach(light => {
-            this.scene.remove(light);
-            if (light.dispose) {
-                light.dispose();
-            }
-        });
-        
-        console.log('Scene02.dispose: クリーンアップ完了');
-        
-        // 親クラスのdisposeを呼ぶ
         super.dispose();
+    }
+    
+    initCameraDebugObjects() {
+        if (!this.cameraDebugGroup) return;
+        
+        const sphereSize = 0.03;
+        const circleRadius = 0.08;
+        const circleSegments = 32;
+        
+        this.cameraDebugTextPositions = [];
+        
+        for (let i = 0; i < this.cameraParticles.length; i++) {
+            const sphereGeometry = new THREE.SphereGeometry(sphereSize, 32, 32);
+            const sphereMaterial = new THREE.MeshStandardMaterial({
+                color: 0xff0000,
+                transparent: false,
+                opacity: 1.0,
+                emissive: 0x330000,
+                emissiveIntensity: 0.2,
+                roughness: 0.8,
+                metalness: 0.0
+            });
+            const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+            sphere.visible = false;
+            this.cameraDebugGroup.add(sphere);
+            this.cameraDebugSpheres.push(sphere);
+            
+            const ringGeom = new THREE.RingGeometry(circleRadius * 0.94, circleRadius, circleSegments);
+            const ringMat = new THREE.MeshBasicMaterial({
+                color: 0xff0000,
+                transparent: true,
+                opacity: 1.0,
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+            const circleXY = new THREE.Mesh(ringGeom, ringMat);
+            circleXY.rotation.x = -Math.PI / 2;
+            circleXY.visible = false;
+            circleXY.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleXY);
+            
+            const circleXZ = new THREE.Mesh(ringGeom.clone(), ringMat.clone());
+            circleXZ.visible = false;
+            circleXZ.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleXZ);
+            
+            const circleYZ = new THREE.Mesh(ringGeom.clone(), ringMat.clone());
+            circleYZ.rotation.y = Math.PI / 2;
+            circleYZ.visible = false;
+            circleYZ.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleYZ);
+            
+            this.cameraDebugCircles.push([circleXY, circleXZ, circleYZ]);
+            
+            const lineGeometry = new THREE.BufferGeometry();
+            const linePositions = new Float32Array(6);
+            const linePosAttr = new THREE.BufferAttribute(linePositions, 3);
+            lineGeometry.setAttribute('position', linePosAttr);
+            const lineMaterial = new THREE.LineBasicMaterial({
+                color: 0xff0000,
+                transparent: false,
+                opacity: 1.0
+            });
+            const line = new THREE.Line(lineGeometry, lineMaterial);
+            line.visible = false;
+            line.userData.positionAttr = linePosAttr;
+            this.cameraDebugGroup.add(line);
+            this.cameraDebugLines.push(line);
+        }
     }
 }
 

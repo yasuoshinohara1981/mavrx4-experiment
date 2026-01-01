@@ -1,211 +1,245 @@
 /**
- * SceneTemplate: シーンのテンプレート
- * 新しいシーンを作成する際は、このファイルをコピーして使用してください
+ * SceneTemplate（WebGPU）
+ *
+ * 新しいシーンを追加するときは、基本的にこのクラスを継承して作る。
+ * - HUD / スクリーンショット文字
+ * - HDRI環境の適用
+ * - PostFX（invert/chroma/glitch + bloom + overlay合成）
+ * - OrbitControls（ライブ用途でデフォ無効）
+ *
+ * 使い方（最小）:
+ * - `src/scenes/sceneXX/SceneXX.js` を作る
+ * - `export class SceneXX extends SceneTemplate { ... }`
+ * - `constructor()` で `this.title` と `this.trackEffects` だけ決める
+ * - シーン固有の更新は `onUpdate()`、OSCトラック処理は `handleTrackNumber()` を上書き
  */
 
 import { SceneBase } from './SceneBase.js';
-import * as THREE from 'three';
+import * as THREE from "three/webgpu";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+import hdri from '../assets/autumn_field_puresky_1k.hdr';
+import { conf } from '../common/conf.js';
+import { loadHdrCached } from '../lib/hdrCache.js';
 
 export class SceneTemplate extends SceneBase {
-    constructor(renderer, camera) {
+    constructor(renderer, camera, sharedResourceManager = null) {
         super(renderer, camera);
-        this.title = 'Scene Template';  // シーンのタイトルを設定
-        
-        // ============================================
-        // ここにシーン固有のプロパティを定義
-        // ============================================
-        // 例：
-        // this.particles = [];
-        // this.time = 0.0;
-        // this.parameter1 = 100.0;
-        
-        // スクリーンショット用テキスト
-        this.setScreenshotText(this.title);
+        this.sharedResourceManager = sharedResourceManager;
+
+        // ここは子クラス側で上書きする想定
+        this.title = 'SceneTemplate';
+        this.trackEffects = {
+            1: true,
+            2: true,  // invert
+            3: true,  // chroma
+            4: true,  // glitch
+            5: true,  // scene specific
+            6: false,
+            7: false,
+            8: false,
+            9: false,
+        };
     }
-    
+
     /**
-     * セットアップ処理（シーン切り替え時に呼ばれる）
-     * 非同期処理（シェーダーの読み込みなど）を行う場合は async を使用
+     * 共通セットアップ
+     * - 子クラスが上書きする場合は `await super.setup()` を最初に呼ぶこと
      */
     async setup() {
-        // 親クラスのsetup()を呼ぶ（ColorInversionの初期化を含む）
         await super.setup();
-        
-        // カメラパーティクルの距離パラメータを再設定（必要に応じて）
-        if (this.cameraParticles) {
-            for (const cameraParticle of this.cameraParticles) {
-                this.setupCameraParticleDistance(cameraParticle);
-            }
-        }
-        
-        // ============================================
-        // ここにシーン固有の初期化処理を記述
-        // ============================================
-        // 例：
-        // - パーティクルシステムの初期化
-        // - ライトの追加
-        // - 3Dオブジェクトの作成
-        // - シェーダーの読み込み
-        // - 背景グラデーションの初期化
+
+        // スクリーンショット用テキスト
+        this.setScreenshotText(this.title);
+
+        // カメラ（子クラスで変えたい場合は上書きOK）
+        this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
+        this.camera.position.set(0, 0.0, 2.0);
+        this.camera.lookAt(0, 0, 0);
+        this.camera.updateProjectionMatrix();
+
+        // シーン（FX対象 + overlay合成）
+        this.scene = new THREE.Scene();
+        this.overlayScene = new THREE.Scene();
+        this.overlayScene.background = null;
+
+        // ライブ用途：マウス操作は基本OFF（必要なら子クラスでONに）
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.target.set(0, 0, 0);
+        this.controls.enableDamping = true;
+        this.controls.enablePan = false;
+        this.controls.maxDistance = 5.0;
+        this.controls.minDistance = 0.5;
+        this.controls.enabled = false;
+
+        // HDRI（共通）
+        const hdriTexture = await loadHdrCached(hdri);
+        this.applyHdriEnvironment(hdriTexture);
+
+        // shadowMap は各シーンで個別に設定する（SceneTemplateでは設定しない）
+        // 子クラスのsetup()で this._shadowMapEnabled と this._shadowMapType を設定すること
+
+        // PostFX（共通）
+        this.initPostFX();
     }
-    
+
     /**
-     * カメラパーティクルの距離パラメータを設定
-     * シーンに応じてカメラの距離範囲を調整する場合はオーバーライド
+     * SceneManager から呼ばれる：リソースの有効/無効（ライブ用途：disposeはしない）
      */
-    setupCameraParticleDistance(cameraParticle) {
-        // デフォルト値を使用（必要に応じて上書き）
-        // 例：
-        // cameraParticle.minDistance = 400.0;
-        // cameraParticle.maxDistance = 1500.0;
-        // cameraParticle.maxDistanceReset = 1000.0;
+    setResourceActive(active) {
+        this._resourceActive = !!active;
     }
-    
+
     /**
-     * 更新処理（毎フレーム呼ばれる）
-     * @param {number} deltaTime - 前フレームからの経過時間（秒）
+     * update() は SceneBase が呼ぶ（this.time更新など）
+     * 子クラスは onUpdate() を上書きしてシーン固有ロジックを書く
      */
     onUpdate(deltaTime) {
-        // 時間の更新（必要に応じて）
-        // this.time += deltaTime;
-        // または
-        // this.time += this.timeIncrement;
-        // SceneBaseのtimeも更新（HUD表示用）
-        // super.time = this.time;
-        
-        // ============================================
-        // ここにシーン固有の更新処理を記述
-        // ============================================
-        // 例：
-        // - パーティクルの更新
-        // - アニメーションの更新
-        // - パラメータの更新（LFOなど）
-        // - エフェクトの更新
+        // PostFX（track2-4 + duration）を共通で更新
+        this.updatePostFX();
+
+        // controls を使う場合だけ update
+        if (this.controls && this.controls.enabled) {
+            this.controls.update();
+        }
     }
-    
+
     /**
-     * 描画処理（オーバーライド）
-     * 背景色の設定など、シーン固有の描画処理が必要な場合のみオーバーライド
+     * render() は SceneManager が fire-and-forget で呼ぶ
      */
-    render() {
-        // 背景色を設定（必要に応じて）
-        // this.renderer.setClearColor(0x000000);
-        
-        // SceneBaseのrenderメソッドを使用（色反転、glitch、chromaticAberrationを含む）
-        super.render();
-        
-        // ============================================
-        // ここにシーン固有の描画処理を記述（必要に応じて）
-        // ============================================
-        // 例：
-        // - Canvas2Dでの描画
-        // - 追加のレンダリング処理
+    async render() {
+        if (!this.postProcessing) return;
+
+        // 初回レンダリング時の計測（デバッグ用）
+        const isFirstRender = !this._hasRendered;
+        if (isFirstRender) {
+            this._hasRendered = true;
+            const renderStart = performance.now();
+            try {
+                await this.postProcessing.renderAsync();
+            } catch (err) {
+                // WebGPU のノード管理エラーを無視（レンダリングは継続）
+                console.warn(`${this.title || 'Scene'} 初回renderエラー（無視）:`, err);
+            }
+            const renderTime = performance.now() - renderStart;
+            if (renderTime > 10) {
+                console.log(`${this.title || 'Scene'} 初回postProcessing.renderAsync: ${renderTime.toFixed(2)}ms`);
+            }
+        } else {
+            try {
+                await this.postProcessing.renderAsync();
+            } catch (err) {
+                // WebGPU のノード管理エラーをログに出力して確認
+                console.error(`${this.title || 'Scene'} renderエラー:`, err);
+                // エラーが発生してもHUDは表示する
+            }
+        }
+
+        // HUD（最小）
+        if (this.hud && this.showHUD) {
+            const now = performance.now();
+            const frameRate = this.lastFrameTime ? 1.0 / ((now - this.lastFrameTime) / 1000.0) : 60.0;
+            this.lastFrameTime = now;
+
+            const isInverted = this.fxUniforms?.invert ? (this.fxUniforms.invert.value > 0.0) : false;
+            const camPos = this.camera?.position?.clone ? this.camera.position.clone() : new THREE.Vector3();
+            const debugText = (typeof this.getHUDDebugText === 'function') ? (this.getHUDDebugText() || '') : '';
+
+            this.hud.display(
+                frameRate,
+                0,
+                camPos,
+                0,
+                this.time,
+                0,
+                0,
+                0,
+                0,
+                isInverted,
+                this.oscStatus,
+                0,
+                this.trackEffects,
+                this.phase,
+                {
+                    distToTarget: camPos.length(),
+                    fovDeg: this.camera?.fov ?? 60,
+                    cameraY: camPos.y
+                },
+                null,
+                this.currentBar || 0,
+                debugText,
+                this.actualTick || 0
+            );
+        }
+
+        // スクリーンショット用のテキスト描画
+        this.drawScreenshotText();
     }
-    
+
     /**
-     * OSCメッセージの処理
-     * トラック1-4はSceneBaseで処理されるため、トラック5以降を処理
-     * @param {number} trackNumber - トラック番号（5-9）
-     * @param {Object} message - OSCメッセージ
+     * HUD右下のデバッグテキスト用（Scene側でオーバーライド）
+     */
+    getHUDDebugText() {
+        return '';
+    }
+
+    /**
+     * OSC: trackEffects ON/OFF のチェックは SceneBase.handleOSC() 側で行われる
+     * ここでは「トラック番号ごとの処理」を書く（子クラスで上書き可）
      */
     handleTrackNumber(trackNumber, message) {
-        const args = message.args || [];
-        
-        // ============================================
-        // ここにトラック5-9の処理を記述
-        // ============================================
-        // 例：
-        // if (trackNumber === 5) {
-        //     const velocity = args[0] || 127.0;
-        //     const noteNumber = args[1] || 64.0;
-        //     const durationMs = args[2] || 0.0;
-        //     // トラック5の処理
-        // }
-        // else if (trackNumber === 6) {
-        //     // トラック6の処理
-        // }
+        const args = message?.args || [];
+        const velocity = Number(args[1] ?? 127);
+        const durationMs = Number(args[2] ?? 0);
+
+        // track1: カメラランダマイズ（CameraParticleがあるSceneだけ効く）
+        if (trackNumber === 1) {
+            this.applyTrack1CameraImpulse(velocity, durationMs);
+            return;
+        }
+
+        // track2-4 は全シーン共通のPostFXとして扱う
+        if (trackNumber === 2) {
+            if (!this.trackEffects[2]) return;
+            const dur = durationMs > 0 ? durationMs : 150;
+            this.setInvert(true, dur);
+            return;
+        }
+        if (trackNumber === 3) {
+            if (!this.trackEffects[3]) return;
+            const amount = Math.min(Math.max(velocity / 127, 0), 1) * 1.0;
+            const dur = durationMs > 0 ? durationMs : 150;
+            this.setChromatic(amount, dur);
+            return;
+        }
+        if (trackNumber === 4) {
+            if (!this.trackEffects[4]) return;
+            const amount = Math.min(Math.max(velocity / 127, 0), 1) * 0.7;
+            const dur = durationMs > 0 ? durationMs : 150;
+            this.setGlitch(amount, dur);
+            return;
+        }
+
+        // track5以降は子クラス側で自由に
     }
-    
-    /**
-     * キーが押された時の処理（SceneBaseでトラック2,3,4を処理）
-     * シーン固有のキー処理が必要な場合のみオーバーライド
-     * @param {number} trackNumber - トラック番号
-     */
-    handleKeyDown(trackNumber) {
-        // 親クラスのhandleKeyDownを呼ぶ（トラック2,3,4のエフェクトなど）
-        super.handleKeyDown(trackNumber);
-        
-        // ============================================
-        // ここにシーン固有のキー押下処理を記述（必要に応じて）
-        // ============================================
-    }
-    
-    /**
-     * キーが離された時の処理（SceneBaseでトラック2,3,4を処理）
-     * シーン固有のキー処理が必要な場合のみオーバーライド
-     * @param {number} trackNumber - トラック番号
-     */
-    handleKeyUp(trackNumber) {
-        // 親クラスのhandleKeyUpを呼ぶ（トラック2,3,4のエフェクトなど）
-        super.handleKeyUp(trackNumber);
-        
-        // ============================================
-        // ここにシーン固有のキー離上処理を記述（必要に応じて）
-        // ============================================
-    }
-    
-    /**
-     * リセット処理
-     */
+
     reset() {
-        super.reset(); // TIMEをリセット
-        
-        // ============================================
-        // ここにシーン固有のリセット処理を記述
-        // ============================================
-        // 例：
-        // - パラメータのリセット
-        // - パーティクルのクリア
-        // - アニメーションのリセット
-        // - オブジェクトの再初期化
+        super.reset();
+        // PostFXを確実にOFF
+        this.setInvert(false, 0);
+        this.setChromatic(0.0, 0);
+        this.setGlitch(0.0, 0);
     }
-    
-    /**
-     * リサイズ処理
-     */
-    onResize() {
-        // 親クラスのonResizeを呼ぶ（スクリーンショット用Canvasのリサイズ）
-        super.onResize();
-        
-        // ============================================
-        // ここにシーン固有のリサイズ処理を記述（必要に応じて）
-        // ============================================
-        // 例：
-        // - Canvasのリサイズ
-        // - EffectComposerのリサイズ
-        // - シェーダーのリサイズ
-    }
-    
-    /**
-     * クリーンアップ処理（シーン切り替え時に呼ばれる）
-     * Three.jsのオブジェクトを破棄してメモリリークを防ぐ
-     */
+
     dispose() {
-        console.log('SceneTemplate.dispose: クリーンアップ開始');
-        
-        // ============================================
-        // ここにシーン固有のクリーンアップ処理を記述
-        // ============================================
-        // 例：
-        // - パーティクルシステムの破棄
-        // - 3Dオブジェクトの削除
-        // - ライトの削除
-        // - Canvasの削除
-        // - イベントリスナーの削除
-        
-        console.log('SceneTemplate.dispose: クリーンアップ完了');
-        
-        // 親クラスのdisposeを呼ぶ（最後に呼ぶ）
+        if (this.postProcessing) {
+            try {
+                this.postProcessing.dispose();
+            } catch (e) {
+                // WebGPU のノード管理エラーを無視
+            }
+        }
         super.dispose();
     }
 }
+
+

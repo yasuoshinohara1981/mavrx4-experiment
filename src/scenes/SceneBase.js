@@ -1,15 +1,33 @@
 /**
- * シーンの基底クラス
+ * シーンの基底クラス（WebGPU版）
  * すべてのシーンはこのクラスを継承
  */
 
-import * as THREE from 'three';
-import { CameraParticle } from '../lib/CameraParticle.js';
+import * as THREE from "three/webgpu";
 import { HUD } from '../lib/HUD.js';
-import { ColorInversion } from '../lib/ColorInversion.js';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { conf } from '../common/conf.js';
+import { bloom } from 'three/examples/jsm/tsl/display/BloomNode.js';
+import {
+    float,
+    Fn,
+    mrt,
+    output,
+    pass,
+    vec2,
+    vec3,
+    vec4,
+    uv,
+    length,
+    normalize,
+    dot,
+    sin,
+    fract,
+    floor,
+    step,
+    mix,
+    time,
+    uniform
+} from "three/tsl";
 
 export class SceneBase {
     constructor(renderer, camera) {
@@ -17,58 +35,33 @@ export class SceneBase {
         this.camera = camera;
         this.scene = null;
         this.title = 'Base Scene';
-        
-        // 背景色の制御
-        this.backgroundWhite = false;
-        this.backgroundWhiteEndTime = 0;
-        
-        // カメラパーティクル
-        this.cameraParticles = [];
-        this.currentCameraIndex = 0;
-        this.cameraTriggerCounter = 0;
-        this.cameraTriggerInterval = 180;
+        this.overlayScene = null;
         
         // HUD
         this.hud = null;
         this.showHUD = true;
-        this.lastFrameTime = null;  // FPS計算用
-        this.oscStatus = 'Unknown';  // OSC接続状態
-        this.particleCount = 0;  // パーティクル数
-        this.time = 0.0;  // 時間変数（サブクラスで設定）
+        this.lastFrameTime = null;
+        this.oscStatus = 'Unknown';
+        this.phase = 0;
+        // Max側の“時間”入力（再生開始からの累積tick）
+        // - 96 tick = 1拍
+        // - 96 tick * 4拍 = 1小節
+        this.actualTick = 0;
+        this.particleCount = 0;
+        this.time = 0.0;
         
-        // 色反転エフェクト（共通化）
-        this.colorInversion = null;
-        
-        // ポストプロセッシングエフェクト（共通化）
-        this.composer = null;
-        this.chromaticAberrationPass = null;
-        this.chromaticAberrationAmount = 0.0;  // 色収差の強度（0.0〜1.0）
-        this.chromaticAberrationEndTime = 0;  // エフェクト終了時刻（サスティン用）
-        this.chromaticAberrationKeyPressed = false;  // キーが押されているか
-        
-        this.glitchPass = null;
-        this.glitchAmount = 0.0;  // グリッチの強度（0.0〜1.0）
-        this.glitchEndTime = 0;  // エフェクト終了時刻（サスティン用）
-        this.glitchKeyPressed = false;  // キーが押されているか
-        
-        // 表示設定
-        this.SHOW_PARTICLES = false;
-        this.SHOW_LINES = true;
-        this.SHOW_CAMERA_DEBUG = false;  // カメラパーティクルのデバッグ表示（デフォルトオフ、'c'キーで切り替え）
-        this.SHOW_CAMERA_DEBUG_CIRCLES = false;  // カメラ周りのCircle表示（デフォルトオフ）
-        
-        // カメラデバッグ用オブジェクト
-        this.cameraDebugGroup = null;
-        this.cameraDebugSpheres = [];
-        this.cameraDebugLines = [];
-        this.cameraDebugCircles = [];  // 周囲のCircle
-        this.cameraDebugCanvas = null;
-        this.cameraDebugCtx = null;
-        this.cameraDebugTextPositions = []; // テキスト位置のスムーズ化用
-        
-        // 座標軸ヘルパー（AxesHelper）
-        this.axesHelper = null;
-        this.SHOW_AXES = false;  // デバッグ用：座標軸を表示するか
+        // エフェクト状態管理（トラック1-9のオン/オフ）
+        this.trackEffects = {
+            1: true,  // カメラ切り替え
+            2: true,  // 色反転
+            3: true,  // 色収差
+            4: false,  // グリッチ
+            5: true,   // シーン固有のエフェクト
+            6: false,
+            7: false,
+            8: false,
+            9: false
+        };
         
         // スクリーンショット用テキスト
         this.screenshotText = '';
@@ -82,20 +75,24 @@ export class SceneBase {
         this.screenshotCanvas = null;
         this.screenshotCtx = null;
         this.screenshotExecuting = false;  // スクリーンショット実行中フラグ
-        
-        // エフェクト状態管理（トラック1-9のオン/オフ）
-        // デフォルト：3と4以外はオン
-        this.trackEffects = {
-            1: true,   // カメラ切り替え（表示のみ、実際の切り替えは別処理）
-            2: true,   // 色反転
-            3: false,  // 色収差（オフ）
-            4: false,  // グリッチ（オフ）
-            5: true,   // シーン固有のエフェクト（爆発、圧力など）
-            6: true,   // 予備
-            7: true,   // 予備
-            8: true,   // 予備
-            9: true    // 予備
-        };
+        this.backgroundWhite = false;  // 背景が白かどうか（テキスト色の判定用）
+
+        // ===== カメラパーティクルのデバッグ表示（mavrx4互換・共通化）=====
+        this.SHOW_CAMERA_DEBUG = false;          // c/Cでトグル
+        this.SHOW_CAMERA_DEBUG_CIRCLES = false;  // 予備（必要なら後でキー追加）
+        this.SHOW_AXES = false;
+        this.cameraCenter = new THREE.Vector3(0, 0, 0);
+        this.cameraParticles = [];
+        this.currentCameraIndex = 0;
+
+        this.cameraDebugGroup = null;
+        this.cameraDebugSpheres = [];
+        this.cameraDebugLines = [];
+        this.cameraDebugCircles = [];
+        this.cameraDebugCanvas = null;
+        this.cameraDebugCtx = null;
+        this.cameraDebugTextPositions = [];
+        this.axesHelper = null;
         
         this.init();
     }
@@ -104,17 +101,296 @@ export class SceneBase {
         // シーンを作成
         this.scene = new THREE.Scene();
         
-        // デバッグ用シーンを作成（エフェクトから除外するため）
-        this.debugScene = new THREE.Scene();
+        // HUDを初期化（SceneBaseはHUDのみ共通化する）
+        this.initializeHUD();
+    }
+
+    /**
+     * カメラデバッグ表示の初期化（各Sceneのsetup後に呼ぶ）
+     * - overlayScene がある場合はそこに描画（FX対象外/上に出す用途）
+     */
+    initCameraDebug(targetScene = null) {
+        const hostScene = targetScene || this.overlayScene || this.scene;
+        if (!hostScene) {
+            console.warn('SceneBase.initCameraDebug: hostScene is null', {
+                targetScene,
+                overlayScene: this.overlayScene,
+                scene: this.scene
+            });
+            return;
+        }
+        if (!this.cameraParticles || this.cameraParticles.length === 0) {
+            console.warn('SceneBase.initCameraDebug: cameraParticles is empty', {
+                cameraParticles: this.cameraParticles,
+                length: this.cameraParticles?.length
+            });
+            return;
+        }
+
+        // group
+        if (!this.cameraDebugGroup) {
+            this.cameraDebugGroup = new THREE.Group();
+            hostScene.add(this.cameraDebugGroup);
+        } else if (this.cameraDebugGroup.parent !== hostScene) {
+            try { this.cameraDebugGroup.parent?.remove(this.cameraDebugGroup); } catch (_) {}
+            hostScene.add(this.cameraDebugGroup);
+        }
+        this.cameraDebugGroup.visible = !!this.SHOW_CAMERA_DEBUG;
         
-        // カメラとHUDを初期化
-        this.initializeCameraAndHUD();
-        
-        // カメラデバッグ用グループを作成（元のsceneに追加）
-        this.cameraDebugGroup = new THREE.Group();
-        this.scene.add(this.cameraDebugGroup);
-        
-        // カメラデバッグ用Canvasを作成
+        // デバッグ: hostSceneが正しく設定されているか確認
+        if (this.cameraDebugGroup.parent !== hostScene) {
+            console.warn('SceneBase.initCameraDebug: cameraDebugGroup parent mismatch', {
+                expected: hostScene.constructor?.name || 'unknown',
+                actual: this.cameraDebugGroup.parent?.constructor?.name || 'null',
+                targetScene: targetScene?.constructor?.name || 'null',
+                overlayScene: this.overlayScene?.constructor?.name || 'null',
+                scene: this.scene?.constructor?.name || 'null'
+            });
+        }
+
+        // canvas（テキストラベル用）
+        // NOTE:
+        // - 起動時に全シーンがinitされると Canvas がシーン数分ぶら下がってしまう
+        // - ここでは c キーで有効化された時だけ生成する（3Dの線/球はCanvas無しでもOK）
+        if (this.SHOW_CAMERA_DEBUG) {
+            this._ensureCameraDebugCanvas();
+        }
+
+        // axes
+        if (!this.axesHelper) {
+            // Scene01/02のスケール感に合わせて短め
+            this.axesHelper = new THREE.AxesHelper(0.9);
+            this.axesHelper.visible = false;
+            hostScene.add(this.axesHelper);
+        } else if (this.axesHelper.parent !== hostScene) {
+            try { this.axesHelper.parent?.remove(this.axesHelper); } catch (_) {}
+            hostScene.add(this.axesHelper);
+        }
+
+        // 子クラスが独自のinitCameraDebugObjectsを持っている場合はそれを使う
+        if (typeof this.initCameraDebugObjects === 'function') {
+            this.initCameraDebugObjects();
+        } else {
+            this._rebuildCameraDebugObjects();
+        }
+    }
+
+    getCameraDebugConfig() {
+        // Sphereがデカい問題が出やすいので小さめデフォルト
+        return {
+            sphereSize: 0.018,
+            circleRadius: 0.06,
+            circleSegments: 28
+        };
+    }
+
+    _rebuildCameraDebugObjects() {
+        if (!this.cameraDebugGroup) return;
+        const n = this.cameraParticles?.length || 0;
+        if (n <= 0) return;
+
+        // 既存を破棄（数が変わった/初期化し直したいケース用）
+        this.cameraDebugGroup.clear();
+        this.cameraDebugSpheres = [];
+        this.cameraDebugLines = [];
+        this.cameraDebugCircles = [];
+        this.cameraDebugTextPositions = [];
+
+        const conf = this.getCameraDebugConfig();
+        const sphereSize = conf.sphereSize ?? 0.012;
+        const circleRadius = conf.circleRadius ?? 0.045;
+        const circleSegments = conf.circleSegments ?? 28;
+
+        for (let i = 0; i < n; i++) {
+            const sphereGeometry = new THREE.SphereGeometry(sphereSize, 20, 20);
+            // NOTE: overlaySceneにライトが無いケースでも見えるよう MeshBasicMaterial にする
+            const sphereMaterial = new THREE.MeshBasicMaterial({
+                color: 0xff0000,
+                transparent: false,
+                opacity: 1.0
+            });
+            const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+            sphere.visible = false;
+            this.cameraDebugGroup.add(sphere);
+            this.cameraDebugSpheres.push(sphere);
+
+            const ringGeom = new THREE.RingGeometry(circleRadius * 0.94, circleRadius, circleSegments);
+            const ringMat = new THREE.MeshBasicMaterial({
+                color: 0xff0000,
+                transparent: true,
+                opacity: 1.0,
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+            const circleXY = new THREE.Mesh(ringGeom, ringMat);
+            circleXY.rotation.x = -Math.PI / 2;
+            circleXY.visible = false;
+            circleXY.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleXY);
+
+            const circleXZ = new THREE.Mesh(ringGeom.clone(), ringMat.clone());
+            circleXZ.visible = false;
+            circleXZ.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleXZ);
+
+            const circleYZ = new THREE.Mesh(ringGeom.clone(), ringMat.clone());
+            circleYZ.rotation.y = Math.PI / 2;
+            circleYZ.visible = false;
+            circleYZ.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleYZ);
+
+            this.cameraDebugCircles.push([circleXY, circleXZ, circleYZ]);
+
+            const lineGeometry = new THREE.BufferGeometry();
+            const linePositions = new Float32Array(6);
+            const linePosAttr = new THREE.BufferAttribute(linePositions, 3);
+            lineGeometry.setAttribute('position', linePosAttr);
+            const lineMaterial = new THREE.LineBasicMaterial({
+                color: 0xff0000,
+                transparent: false,
+                opacity: 1.0
+            });
+            const line = new THREE.Line(lineGeometry, lineMaterial);
+            line.visible = false;
+            line.userData.positionAttr = linePosAttr;
+            this.cameraDebugGroup.add(line);
+            this.cameraDebugLines.push(line);
+        }
+    }
+
+    _drawCameraDebug() {
+        if (this.cameraDebugCtx && this.cameraDebugCanvas) {
+            this.cameraDebugCtx.clearRect(0, 0, this.cameraDebugCanvas.width, this.cameraDebugCanvas.height);
+        }
+        if (!this.SHOW_CAMERA_DEBUG) return;
+        if (!this.cameraDebugGroup) {
+            console.warn('SceneBase._drawCameraDebug: cameraDebugGroup is null');
+            return;
+        }
+        if (!this.cameraParticles || this.cameraParticles.length === 0) {
+            console.warn('SceneBase._drawCameraDebug: cameraParticles is empty', {
+                cameraParticles: this.cameraParticles,
+                length: this.cameraParticles?.length
+            });
+            return;
+        }
+        // NOTE: projectはVector3側のメソッド。cameraにprojectは無いのでチェックしない。
+
+        this.cameraDebugGroup.visible = true;
+        if (this.axesHelper) this.axesHelper.visible = !!this.SHOW_AXES;
+
+        const center = (this.cameraCenter && this.cameraCenter.clone) ? this.cameraCenter.clone() : new THREE.Vector3(0, 0, 0);
+
+        for (let i = 0; i < this.cameraParticles.length; i++) {
+            const cp = this.cameraParticles[i];
+            if (!cp) continue;
+            // getPositionメソッドがある場合はそれを使う、なければpositionプロパティを使う
+            let pos;
+            if (cp.getPosition && typeof cp.getPosition === 'function') {
+                pos = cp.getPosition().clone();
+            } else if (cp.position) {
+                pos = cp.position.clone();
+            } else {
+                pos = center.clone();
+            }
+            pos.add(center);
+            
+            // NaNチェック
+            if (isNaN(pos.x) || isNaN(pos.y) || isNaN(pos.z)) {
+                console.warn(`SceneBase._drawCameraDebug: NaN detected for camera ${i}`, {
+                    cp,
+                    getPosition: cp.getPosition ? cp.getPosition() : null,
+                    position: cp.position,
+                    center
+                });
+                continue;
+            }
+
+            const sphere = this.cameraDebugSpheres[i];
+            if (sphere) {
+                sphere.position.copy(pos);
+                sphere.visible = true;
+            } else {
+                console.warn(`SceneBase._drawCameraDebug: sphere ${i} is missing`, {
+                    spheresLength: this.cameraDebugSpheres?.length,
+                    cameraParticlesLength: this.cameraParticles.length
+                });
+            }
+
+            const circles = this.cameraDebugCircles[i];
+            if (circles && Array.isArray(circles)) {
+                circles.forEach((c) => {
+                    if (!c) return;
+                    c.position.copy(pos);
+                    c.visible = !!this.SHOW_CAMERA_DEBUG_CIRCLES;
+                });
+            }
+
+            const line = this.cameraDebugLines[i];
+            if (line?.userData?.positionAttr) {
+                const attr = line.userData.positionAttr;
+                const a = attr.array;
+                a[0] = pos.x; a[1] = pos.y; a[2] = pos.z;
+                a[3] = center.x; a[4] = center.y; a[5] = center.z;
+                attr.needsUpdate = true;
+                line.visible = true;
+            }
+
+            if (this.cameraDebugCtx && this.cameraDebugCanvas) {
+                const v = pos.clone();
+                v.project(this.camera);
+                const x = (v.x * 0.5 + 0.5) * this.cameraDebugCanvas.width;
+                const y = (-v.y * 0.5 + 0.5) * this.cameraDebugCanvas.height;
+
+                if (x >= 0 && x <= this.cameraDebugCanvas.width && y >= 0 && y <= this.cameraDebugCanvas.height && v.z < 1.0 && v.z > -1.0) {
+                    if (!this.cameraDebugTextPositions[i]) {
+                        this.cameraDebugTextPositions[i] = { x, y };
+                    }
+                    const prev = this.cameraDebugTextPositions[i];
+                    const dx = x - prev.x;
+                    const dy = y - prev.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    const smoothX = dist < 100 ? (prev.x * 0.3 + x * 0.7) : x;
+                    const smoothY = dist < 100 ? (prev.y * 0.3 + y * 0.7) : y;
+
+                    this.cameraDebugCtx.save();
+                    this.cameraDebugCtx.fillStyle = 'white';
+                    this.cameraDebugCtx.font = '16px monospace';
+                    this.cameraDebugCtx.textAlign = 'center';
+                    this.cameraDebugCtx.textBaseline = 'bottom';
+                    this.cameraDebugCtx.fillText(`camera #${i + 1}`, smoothX, smoothY - 42);
+                    this.cameraDebugCtx.restore();
+
+                    this.cameraDebugTextPositions[i] = { x: smoothX, y: smoothY };
+                }
+            }
+        }
+    }
+
+    handleKeyPress(key) {
+        // 共通キー（mavrx4互換）
+        if (key === 'c') {
+            this.SHOW_CAMERA_DEBUG = !this.SHOW_CAMERA_DEBUG;
+            if (this.SHOW_CAMERA_DEBUG) {
+                // ONにした瞬間にCanvas/Groupを確実に用意
+                this.initCameraDebug();
+            }
+            if (this.cameraDebugGroup) this.cameraDebugGroup.visible = !!this.SHOW_CAMERA_DEBUG;
+            this.SHOW_AXES = this.SHOW_CAMERA_DEBUG;
+            if (this.axesHelper) this.axesHelper.visible = !!this.SHOW_AXES;
+            return true;
+        }
+        if (key === 'C') {
+            if (this.cameraParticles?.length) {
+                this.currentCameraIndex = (this.currentCameraIndex + 1) % this.cameraParticles.length;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    _ensureCameraDebugCanvas() {
+        if (this.cameraDebugCanvas) return;
         this.cameraDebugCanvas = document.createElement('canvas');
         this.cameraDebugCanvas.width = window.innerWidth;
         this.cameraDebugCanvas.height = window.innerHeight;
@@ -124,37 +400,334 @@ export class SceneBase {
         this.cameraDebugCanvas.style.pointerEvents = 'none';
         this.cameraDebugCanvas.style.zIndex = '1000';
         this.cameraDebugCtx = this.cameraDebugCanvas.getContext('2d');
-        this.cameraDebugCtx.font = '16px monospace';
-        this.cameraDebugCtx.textAlign = 'center';
-        this.cameraDebugCtx.textBaseline = 'bottom';
+        if (this.cameraDebugCtx) {
+            this.cameraDebugCtx.font = '16px monospace';
+            this.cameraDebugCtx.textAlign = 'center';
+            this.cameraDebugCtx.textBaseline = 'bottom';
+        }
         document.body.appendChild(this.cameraDebugCanvas);
-        
-        // カメラデバッグ用オブジェクトを初期化
-        this.initCameraDebugObjects();
-        
-        // 座標軸ヘルパーを作成（元のsceneに追加）
-        this.axesHelper = new THREE.AxesHelper(1000);  // 1000の長さの軸
-        this.axesHelper.visible = this.SHOW_AXES;
-        this.scene.add(this.axesHelper);
     }
     
     /**
-     * カメラとHUDの初期化（共通処理）
+     * HUDの初期化（共通処理）
      */
-    initializeCameraAndHUD() {
-        // カメラ用パーティクルを初期化（8個）
-        for (let i = 0; i < 8; i++) {
-            const cameraParticle = new CameraParticle();
-            this.setupCameraParticleDistance(cameraParticle);
-            this.cameraParticles.push(cameraParticle);
-        }
-        this.currentCameraIndex = 0;
-        
+    initializeHUD() {
         // HUDを初期化
         this.hud = new HUD();
+        // NOTE:
+        // スクリーンショットCanvasは重い＆各SceneごとにDOMが増えるので遅延生成にする。
+        // drawScreenshotText() 側で必要になったタイミングで initScreenshotCanvas() される。
+    }
+
+    /**
+     * 共通：環境（HDRI）を scene / overlayScene に適用
+     * - Scene01/02でのコピペをなくし、数値のブレも防ぐ
+     */
+    applyHdriEnvironment(hdriTexture, {
+        envRotationY = -2.15,
+        envIntensity = 0.5,
+        exposure = 0.66,
+        backgroundColor = 0x000000,
+        applyToOverlay = true
+    } = {}) {
+        if (!hdriTexture) return;
+        if (this.scene) {
+            this.scene.background = (backgroundColor != null) ? new THREE.Color(backgroundColor) : this.scene.background;
+            this.scene.environment = hdriTexture;
+            this.scene.environmentRotation = new THREE.Euler(0, envRotationY, 0);
+            this.scene.environmentIntensity = envIntensity;
+        }
+        if (applyToOverlay && this.overlayScene) {
+            this.overlayScene.background = null;
+            this.overlayScene.environment = hdriTexture;
+            this.overlayScene.environmentRotation = new THREE.Euler(0, envRotationY, 0);
+            this.overlayScene.environmentIntensity = envIntensity;
+        }
+        if (this.renderer) {
+            this.renderer.toneMappingExposure = exposure;
+        }
+        this.hdriTexture = hdriTexture;
+    }
+
+    /**
+     * 共通：ポストFX（track2-4） + bloom + overlay合成
+     * - Scene01/02で同じノードグラフを組むのを共通化
+     */
+    initPostFX({ scene = null, overlayScene = null, camera = null } = {}) {
+        const baseScene = scene || this.scene;
+        const ovScene = overlayScene || this.overlayScene;
+        const cam = camera || this.camera;
+        if (!baseScene || !ovScene || !cam || !this.renderer) {
+            console.warn('SceneBase.initPostFX: Missing required parameters', {
+                baseScene: !!baseScene,
+                ovScene: !!ovScene,
+                cam: !!cam,
+                renderer: !!this.renderer,
+                scene: !!scene,
+                overlayScene: !!overlayScene,
+                camera: !!camera,
+                thisScene: !!this.scene,
+                thisOverlayScene: !!this.overlayScene,
+                thisCamera: !!this.camera
+            });
+            return;
+        }
+
+        const scenePass = pass(baseScene, cam);
+        // MRT設定：outputとbloomIntensity（emissiveの代わりにカスタム出力を使用）
+        scenePass.setMRT(mrt({
+            output,
+            bloomIntensity: output  // 一時的にoutputと同じにする（後でbloomIntensityを正しく設定する）
+        }));
+        const outputPass = scenePass.getTextureNode();
+        const bloomIntensityPass = scenePass.getTextureNode('bloomIntensity');
+        // 深度バッファを取得（DOF用）- 利用可能かどうかをチェック
+        let depthPass = null;
+        try {
+            depthPass = scenePass.getTextureNode('depth');
+        } catch (e) {
+            // 深度バッファが利用できない場合は null のまま
+            depthPass = null;
+        }
+        // bloomIntensityPassはoutputと同じなので、outputPassを使う
+        const bloomPass = conf.bloom ? bloom(outputPass) : null;
+
+        const overlayPass = pass(ovScene, cam);
+        const overlayTex = overlayPass.getTextureNode();
+
+        const postProcessing = new THREE.PostProcessing(this.renderer);
+        postProcessing.outputColorTransform = false;
+
+        this.fxUniforms = {
+            invert: uniform(0.0),
+            chromaAmount: uniform(0.0),
+            glitchAmount: uniform(0.0),
+            // 軽量DOF“っぽい”ブラー（深度無し / コスト低め）
+            // NOTE: 本物のDOFではない（遠景ボケの空気感だけ）
+            dofAmount: uniform(0.0),
+            // CG感を少し抑える“エッジソフト”（超軽量：輝度差でブラーを混ぜる）
+            edgeSoft: uniform(0.0),
+            // SSAOっぽい“締まり”を出すための超軽量vignette（擬似AO）
+            // NOTE: 本物のSSAOではない（深度/法線不要・ほぼコスト0）
+            fakeAO: uniform(0.0),
+        };
+        this.fxEndTimeMs = {
+            invert: 0,
+            chroma: 0,
+            glitch: 0,
+        };
+
+        const fxInvert = this.fxUniforms.invert;
+        const fxChroma = this.fxUniforms.chromaAmount;
+        const fxGlitch = this.fxUniforms.glitchAmount;
+        const fxDOF = this.fxUniforms.dofAmount;
+        const fxEdgeSoft = this.fxUniforms.edgeSoft;
+        const fxFakeAO = this.fxUniforms.fakeAO;
+
+        postProcessing.outputNode = Fn(() => {
+            // uv / dist
+            const u = uv().toVar();
+            const center = vec2(0.5, 0.5).toVar();
+            const dv = u.sub(center).toVar();
+            const dir = normalize(dv).toVar();
+            const dist = length(dv).toVar();
+
+            // base color
+            const c0 = outputPass.sample(u).rgb.clamp(0, 1).toVar();
+
+            // 0) 軽量DOF“っぽい”ブラー（画面端ほどぼかす / 深度不要）
+            const dof = fxDOF.clamp(0.0, 1.0).toVar();
+            // 強すぎたので半径を少し戻す
+            const dofOff = dof.mul(0.012).toVar();
+            const sx1 = outputPass.sample(u.add(vec2(dofOff, 0.0))).rgb.clamp(0, 1).toVar();
+            const sx2 = outputPass.sample(u.sub(vec2(dofOff, 0.0))).rgb.clamp(0, 1).toVar();
+            const sy1 = outputPass.sample(u.add(vec2(0.0, dofOff))).rgb.clamp(0, 1).toVar();
+            const sy2 = outputPass.sample(u.sub(vec2(0.0, dofOff))).rgb.clamp(0, 1).toVar();
+            // 対角も足して、ボケが「十字」っぽくなるのを軽減（+4サンプル）
+            const sxy1 = outputPass.sample(u.add(vec2(dofOff, dofOff))).rgb.clamp(0, 1).toVar();
+            const sxy2 = outputPass.sample(u.add(vec2(dofOff, dofOff.negate()))).rgb.clamp(0, 1).toVar();
+            const sxy3 = outputPass.sample(u.add(vec2(dofOff.negate(), dofOff))).rgb.clamp(0, 1).toVar();
+            const sxy4 = outputPass.sample(u.add(vec2(dofOff.negate(), dofOff.negate()))).rgb.clamp(0, 1).toVar();
+
+            const blur = c0.mul(0.26)
+                .add(sx1.mul(0.11)).add(sx2.mul(0.11))
+                .add(sy1.mul(0.11)).add(sy2.mul(0.11))
+                .add(sxy1.mul(0.075)).add(sxy2.mul(0.075))
+                .add(sxy3.mul(0.075)).add(sxy4.mul(0.075))
+                .clamp(0, 1).toVar();
+
+            // 端寄りから効く（やりすぎない）
+            const td = dist.sub(float(0.06)).div(float(0.40)).clamp(0.0, 1.0).toVar();
+            const sm = td.mul(td).mul(float(3.0).sub(td.mul(2.0))).toVar();
+            const dofMix = sm.mul(dof).clamp(0.0, 1.0).toVar();
+            const base = mix(c0, blur, dofMix).toVar();
+
+            // 0.5) エッジソフト（軽量）: 輝度差で“輪郭だけ”少しブラーを混ぜる
+            // NOTE: 既に取ったサンプル（sx/sy）を再利用してコストを増やさない
+            const lumaW = vec3(0.299, 0.587, 0.114).toVar();
+            const lum0 = dot(base, lumaW).toVar();
+            const lumX1 = dot(sx1, lumaW).toVar();
+            const lumX2 = dot(sx2, lumaW).toVar();
+            const lumY1 = dot(sy1, lumaW).toVar();
+            const lumY2 = dot(sy2, lumaW).toVar();
+            const e = lum0.sub(lumX1).abs()
+                .add(lum0.sub(lumX2).abs())
+                .add(lum0.sub(lumY1).abs())
+                .add(lum0.sub(lumY2).abs())
+                .mul(1.8)
+                .clamp(0.0, 1.0)
+                .toVar();
+            const edgeMix = e.mul(fxEdgeSoft.clamp(0.0, 1.0)).clamp(0.0, 1.0).toVar();
+            const baseSoft = mix(base, blur, edgeMix).toVar();
+
+            // 2) invert
+            const inv = mix(baseSoft, vec3(1).sub(baseSoft), fxInvert).toVar();
+
+            // 3) chromatic aberration
+            const off = dir.mul(dist).mul(fxChroma).mul(0.05).toVar();
+            const r = outputPass.sample(u.add(off)).r.toVar();
+            const g = c0.g.toVar();
+            const b0 = outputPass.sample(u.sub(off)).b.toVar();
+            const chromaColor = vec3(r, g, b0).clamp(0, 1).toVar();
+            // NOTE:
+            // 以前は sign() で「0か1」みたいに扱ってたが、Track3のamount(0..1)が効かなくなって
+            // “ONにした瞬間おかしい（効きすぎる）”になりやすいので線形でブレンドする。
+            const chromaMix = mix(inv, chromaColor, fxChroma.clamp(0.0, 1.0)).toVar();
+
+            // 4) glitch（横スライス＋RGBずらし＋明るさ）
+            // DEBUG: timeを固定値にしてブルブル問題を切り分け
+            const tt = float(0.0).toVar();  // time.mul(0.1).toVar();
+
+            const rand2 = (st) => {
+                return fract(sin(dot(st, vec2(12.9898, 78.233))).mul(43758.5453123));
+            };
+
+            const noise2 = (st) => {
+                const i = floor(st).toVar();
+                const f = fract(st).toVar();
+                const a = rand2(i);
+                const b = rand2(i.add(vec2(1.0, 0.0)));
+                const c = rand2(i.add(vec2(0.0, 1.0)));
+                const d0 = rand2(i.add(vec2(1.0, 1.0)));
+                const u2 = f.mul(f).mul(vec2(3.0, 3.0).sub(f.mul(2.0))).toVar();
+                const x1 = mix(a, b, u2.x).toVar();
+                const termC = c.sub(a).mul(u2.y).mul(float(1.0).sub(u2.x)).toVar();
+                const termD = d0.sub(b).mul(u2.x).mul(u2.y).toVar();
+                return x1.add(termC).add(termD);
+            };
+
+            const n = noise2(vec2(u.y.mul(20.0).add(tt.mul(10.0)), tt.mul(5.0))).toVar();
+            const gInt = step(float(0.7), n).mul(fxGlitch).toVar();
+            const offX = n.sub(0.5).mul(gInt).mul(0.1).toVar();
+
+            const sliceDiv = float(30.0);
+            const sliceY = floor(u.y.mul(sliceDiv)).div(sliceDiv).toVar();
+            const sn = noise2(vec2(sliceY, tt.mul(3.0))).toVar();
+            const sInt = step(float(0.8), sn).mul(fxGlitch).toVar();
+            const sOff = sn.sub(0.5).mul(sInt).mul(0.15).toVar();
+
+            const ug = vec2(u.x.add(offX).add(sOff), u.y).toVar();
+            const gr = outputPass.sample(ug.add(vec2(offX.mul(0.5), 0))).r.toVar();
+            const gg = outputPass.sample(ug).g.toVar();
+            const gb = outputPass.sample(ug.sub(vec2(offX.mul(0.5), 0))).b.toVar();
+            const bright = float(1).add(n.sub(0.5).mul(gInt).mul(0.3)).toVar();
+            const glitchColor = vec3(gr, gg, gb).mul(bright).clamp(0, 1).toVar();
+
+            const mixed = mix(chromaMix, glitchColor, fxGlitch.clamp(0.0, 1.0)).toVar();
+
+            // bloom（OFF時は素通し）
+            const outRgb = (conf.bloom && bloomPass)
+                ? (() => {
+                    // bloomIntensityPassはoutputと同じなので、常に1として扱う（bloomを適用）
+                    const bb = bloomPass.rgb.clamp(0, 1);
+                    return vec3(1).sub(bb).sub(bb).mul(mixed).mul(mixed).add(bb.mul(mixed).mul(2)).clamp(0, 1).toVar();
+                })()
+                : mixed;
+
+            // “AOっぽい”締まり：画面端をわずかに落とす（vignette）
+            // distは中心からの距離（0..~0.707）。端ほど暗くする。
+            const vig = dist.clamp(0.0, 1.0).mul(dist.clamp(0.0, 1.0)).toVar();
+            const aoMul = float(1.0).sub(vig.mul(fxFakeAO.clamp(0.0, 1.0)).mul(0.35)).clamp(0.0, 1.0).toVar();
+            const aoRgb = outRgb.mul(aoMul).clamp(0, 1).toVar();
+
+            // overlay（alpha合成）
+            const overlayA = overlayTex.a.clamp(0, 1).toVar();
+            const overlayRgb = overlayTex.rgb.clamp(0, 1).toVar();
+            const finalRgb = mix(aoRgb, overlayRgb, overlayA).clamp(0, 1);
+            return vec4(finalRgb, 1.0);
+        })().renderOutput();
+
+        this.postProcessing = postProcessing;
+        this.bloomPass = bloomPass;
+        if (this.bloomPass) {
+            this.bloomPass.threshold.value = 0.001;
+            this.bloomPass.strength.value = 0.94;
+            this.bloomPass.radius.value = 0.8;
+        }
         
-        // スクリーンショット用Canvasを初期化
-        this.initScreenshotCanvas();
+        console.log('SceneBase.initPostFX: PostFX initialized successfully', {
+            title: this.title || 'Unknown',
+            postProcessing: !!this.postProcessing,
+            bloomPass: !!this.bloomPass
+        });
+    }
+
+    /**
+     * 共通：duration付きFXの自動OFF / trackEffects OFF時の強制0
+     */
+    updatePostFX() {
+        if (!this.fxUniforms || !this.fxEndTimeMs) return;
+
+        // トラック4がOFFならグリッチ量を毎フレーム強制0
+        if (!this.trackEffects?.[4] && this.fxUniforms?.glitchAmount) {
+            this.fxUniforms.glitchAmount.value = 0.0;
+            this.fxEndTimeMs.glitch = 0;
+        }
+        // トラック2がOFFならinvert量を毎フレーム強制0
+        if (!this.trackEffects?.[2] && this.fxUniforms?.invert) {
+            this.fxUniforms.invert.value = 0.0;
+            this.fxEndTimeMs.invert = 0;
+        }
+
+        // durationMs付きのエフェクトを自動でOFFにする
+        const now = Date.now();
+        if (this.fxEndTimeMs.invert > 0 && now >= this.fxEndTimeMs.invert) {
+            this.fxUniforms.invert.value = 0.0;
+            this.fxEndTimeMs.invert = 0;
+        }
+        if (this.fxEndTimeMs.chroma > 0 && now >= this.fxEndTimeMs.chroma) {
+            this.fxUniforms.chromaAmount.value = 0.0;
+            this.fxEndTimeMs.chroma = 0;
+        }
+        if (this.fxEndTimeMs.glitch > 0 && now >= this.fxEndTimeMs.glitch) {
+            this.fxUniforms.glitchAmount.value = 0.0;
+            this.fxEndTimeMs.glitch = 0;
+        }
+
+        // HUD/スクショ用：背景が白扱いかどうかをinvert状態に同期
+        // （黒テキストのまま戻らない、を防ぐ）
+        this.backgroundWhite = !!(this.fxUniforms?.invert && this.fxUniforms.invert.value > 0.0);
+    }
+
+    setInvert(enabled, durationMs = 0) {
+        if (!this.fxUniforms?.invert || !this.fxEndTimeMs) return;
+        this.fxUniforms.invert.value = enabled ? 1.0 : 0.0;
+        this.fxEndTimeMs.invert = durationMs > 0 ? Date.now() + durationMs : 0;
+        this.backgroundWhite = !!enabled;
+    }
+
+    setChromatic(amount01, durationMs = 0) {
+        if (!this.fxUniforms?.chromaAmount || !this.fxEndTimeMs) return;
+        const a = Math.min(Math.max(Number(amount01) || 0, 0), 1);
+        this.fxUniforms.chromaAmount.value = a;
+        this.fxEndTimeMs.chroma = durationMs > 0 ? Date.now() + durationMs : 0;
+    }
+
+    setGlitch(amount01, durationMs = 0) {
+        if (!this.fxUniforms?.glitchAmount || !this.fxEndTimeMs) return;
+        const a = Math.min(Math.max(Number(amount01) || 0, 0), 1);
+        this.fxUniforms.glitchAmount.value = a;
+        this.fxEndTimeMs.glitch = durationMs > 0 ? Date.now() + durationMs : 0;
     }
     
     /**
@@ -197,305 +770,116 @@ export class SceneBase {
     }
     
     /**
-     * カメラパーティクルの距離パラメータを設定（各Sceneでオーバーライド可能）
-     */
-    setupCameraParticleDistance(cameraParticle) {
-        // デフォルト値を使用（各Sceneで必要に応じてオーバーライド）
-    }
-    
-    /**
      * セットアップ処理（シーン切り替え時に呼ばれる）
      */
     async setup() {
-        // 色反転エフェクトを初期化（すべてのシーンで使用可能）
-        console.log('SceneBase.setup: ColorInversion初期化開始');
-        this.colorInversion = new ColorInversion(this.renderer, this.scene, this.camera);
-        console.log('SceneBase.setup: ColorInversionインスタンス作成完了');
-        
-        // init()はコンストラクタで呼ばれるが、非同期処理が完了するまで待つ
-        // シェーダーの読み込みが完了するまで待つ（最大2秒）
-        let waitCount = 0;
-        while (!this.colorInversion.initialized && waitCount < 100) {
-            await new Promise(resolve => setTimeout(resolve, 20));
-            waitCount++;
-        }
-        if (this.colorInversion.initialized) {
-            console.log('SceneBase.setup: ColorInversion初期化完了');
-        } else {
-            console.warn('SceneBase.setup: ColorInversion初期化タイムアウト');
-        }
-        
-        // ポストプロセッシングエフェクトを初期化（すべてのシーンで使用可能）
-        await this.initChromaticAberration();
-        
-        // エフェクトの初期状態を設定（全てオフ）
-        this.initializeEffectStates();
-        
         // サブクラスで実装
     }
     
     /**
-     * エフェクトの初期状態を設定（デフォルトは全てオフ）
-     */
-    initializeEffectStates() {
-        console.log('initializeEffectStates: 開始');
-        
-        // トラック2: 色反転エフェクト（デフォルトはオフ）
-        if (this.colorInversion) {
-            console.log('initializeEffectStates: 色反転エフェクトをオフに設定');
-            this.colorInversion.setEnabled(false);
-            // 確実にオフにするため、もう一度確認
-            if (this.colorInversion.inversionPass) {
-                this.colorInversion.inversionPass.enabled = false;
-            }
-        } else {
-            console.warn('initializeEffectStates: colorInversionがnull');
-        }
-        
-        // トラック3: 色収差エフェクト（デフォルトはオフ）
-        if (this.chromaticAberrationPass) {
-            console.log('initializeEffectStates: 色収差エフェクトをオフに設定');
-            this.chromaticAberrationPass.enabled = false;
-            this.chromaticAberrationAmount = 0.0;
-            this.chromaticAberrationEndTime = 0;
-            this.chromaticAberrationKeyPressed = false;
-        } else {
-            console.warn('initializeEffectStates: chromaticAberrationPassがnull');
-        }
-        
-        // トラック4: グリッチエフェクト（デフォルトはオフ）
-        if (this.glitchPass) {
-            console.log('initializeEffectStates: グリッチエフェクトをオフに設定');
-            this.glitchPass.enabled = false;
-            this.glitchAmount = 0.0;
-            this.glitchEndTime = 0;
-            this.glitchKeyPressed = false;
-        } else {
-            console.warn('initializeEffectStates: glitchPassがnull');
-        }
-        
-        console.log('initializeEffectStates: 完了 - 全てオフ');
-    }
-    
-    /**
-     * 色収差エフェクトを初期化
-     */
-    async initChromaticAberration() {
-        // シェーダーを読み込む
-        const shaderBasePath = `/shaders/common/`;
-        try {
-            const [vertexShader, fragmentShader] = await Promise.all([
-                fetch(`${shaderBasePath}chromaticAberration.vert`).then(r => r.text()),
-                fetch(`${shaderBasePath}chromaticAberration.frag`).then(r => r.text())
-            ]);
-            
-            // EffectComposerを作成
-            if (!this.composer) {
-                this.composer = new EffectComposer(this.renderer);
-                
-                // RenderPassを追加（通常のシーン描画）
-                const renderPass = new RenderPass(this.scene, this.camera);
-                this.composer.addPass(renderPass);
-            }
-            
-            // 色収差シェーダーを作成
-            const chromaticAberrationShader = {
-                uniforms: {
-                    tDiffuse: { value: null },
-                    resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
-                    amount: { value: 0.0 }
-                },
-                vertexShader: vertexShader,
-                fragmentShader: fragmentShader
-            };
-            
-            // ShaderPassを追加
-            this.chromaticAberrationPass = new ShaderPass(chromaticAberrationShader);
-            this.chromaticAberrationPass.enabled = false;  // デフォルトでは無効
-            this.composer.addPass(this.chromaticAberrationPass);
-            
-            // グリッチエフェクトも初期化（composerが作成された後）
-            await this.initGlitchShader();
-        } catch (err) {
-            console.error('色収差シェーダーの読み込みに失敗:', err);
-        }
-    }
-    
-    /**
-     * グリッチシェーダーを初期化（composer作成後）
-     */
-    async initGlitchShader() {
-        if (!this.composer) return;
-        
-        // シェーダーを読み込む
-        const shaderBasePath = `/shaders/common/`;
-        try {
-            const [vertexShader, fragmentShader] = await Promise.all([
-                fetch(`${shaderBasePath}glitch.vert`).then(r => r.text()),
-                fetch(`${shaderBasePath}glitch.frag`).then(r => r.text())
-            ]);
-            
-            // グリッチシェーダーを作成
-            const glitchShader = {
-                uniforms: {
-                    tDiffuse: { value: null },
-                    resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
-                    amount: { value: 0.0 },
-                    time: { value: 0.0 }
-                },
-                vertexShader: vertexShader,
-                fragmentShader: fragmentShader
-            };
-            
-            // ShaderPassを追加
-            this.glitchPass = new ShaderPass(glitchShader);
-            this.glitchPass.enabled = false;  // デフォルトでは無効
-            this.composer.addPass(this.glitchPass);
-        } catch (err) {
-            console.error('グリッチシェーダーの読み込みに失敗:', err);
-        }
-    }
-    
-    /**
      * 更新処理（毎フレーム呼ばれる）
-     * @param {number} deltaTime - 前フレームからの経過時間（秒）
      */
     update(deltaTime) {
-        // 背景色のタイマーチェック
-        if (this.backgroundWhiteEndTime > 0 && Date.now() >= this.backgroundWhiteEndTime) {
-            this.backgroundWhite = false;
-            this.backgroundWhiteEndTime = 0;
-        }
-        
-        // カメラパーティクルの移動を有効/無効化（trackEffects[1]に基づく）
-        this.cameraParticles.forEach(cp => {
-            cp.enableMovement = this.trackEffects[1];
-        });
-        
-        // カメラパーティクルを更新（全部のカメラパーティクルを更新）
-        this.cameraParticles.forEach(cp => {
-            cp.update();
-        });
-        
-        // カメラにランダムな力を加える
-        this.updateCameraForce();
-        
-        // カメラの位置を更新
-        this.updateCamera();
-        
-        // 色反転エフェクトの更新（サスティン終了チェック）
-        if (this.colorInversion) {
-            this.colorInversion.update();
-            // trackEffects[2]がfalseの場合は確実にオフにする
-            if (!this.trackEffects[2] && this.colorInversion.isEnabled()) {
-                this.colorInversion.setEnabled(false);
-            }
-        }
-        
-        // 色収差エフェクトの更新（サスティン終了チェック）
-        this.updateChromaticAberration();
-        // trackEffects[3]がfalseの場合は確実にオフにする
-        if (!this.trackEffects[3] && this.chromaticAberrationPass && this.chromaticAberrationPass.enabled) {
-            this.chromaticAberrationPass.enabled = false;
-            this.chromaticAberrationAmount = 0.0;
-            this.chromaticAberrationEndTime = 0;
-            this.chromaticAberrationKeyPressed = false;
-        }
-        
-        // グリッチエフェクトの更新（サスティン終了チェックと時間更新）
-        this.updateGlitch();
-        // trackEffects[4]がfalseの場合は確実にオフにする
-        if (!this.trackEffects[4] && this.glitchPass && this.glitchPass.enabled) {
-            this.glitchPass.enabled = false;
-            this.glitchAmount = 0.0;
-            this.glitchEndTime = 0;
-            this.glitchKeyPressed = false;
-        }
-        
-        // 時間を更新（HUD表示用、共通処理）
-        // ただし、サブクラスで独自の時間更新（timeIncrementなど）を使っている場合は、そちらで更新される
-        // Scene01やScene07は独自のtimeIncrementを使うため、ここでは更新しない
-        // Scene02など、deltaTimeを使うシーンのみ、ここで更新する
-        // this.time += deltaTime;  // サブクラスで独自更新するため、コメントアウト
-        
+        // SceneBaseはロジックを持たず、Scene側のupdateに委譲する
+        this.time += deltaTime;
+        // 共通：Track1の一時ブースト（maxForce/maxSpeed）の期限切れを戻す
+        // - CameraParticleを使うSceneだけに効く（cameraParticlesが無ければ何もしない）
+        this.updateTrack1CameraBoosts();
         // サブクラスの更新処理
         this.onUpdate(deltaTime);
-    }
-    
-    /**
-     * カメラにランダムな力を加える（共通処理）
-     */
-    updateCameraForce() {
-        // trackEffects[1]がオフの場合は処理をスキップ
-        if (!this.trackEffects[1]) {
-            return;
-        }
-        
-        this.cameraTriggerCounter++;
-        if (this.cameraTriggerCounter >= this.cameraTriggerInterval) {
-            if (this.cameraParticles[this.currentCameraIndex]) {
-                this.cameraParticles[this.currentCameraIndex].applyRandomForce();
+        // 共通：カメラデバッグ描画（ONの時だけ）
+        if (this.SHOW_CAMERA_DEBUG) {
+            // 子クラスが独自のdrawCameraDebugを持っている場合はそれを使う
+            if (typeof this.drawCameraDebug === 'function') {
+                this.drawCameraDebug();
+            } else {
+                this._drawCameraDebug();
             }
-            this.cameraTriggerCounter = 0;
+        } else if (this.cameraDebugCtx && this.cameraDebugCanvas) {
+            // OFF時はCanvasだけクリア
+            this.cameraDebugCtx.clearRect(0, 0, this.cameraDebugCanvas.width, this.cameraDebugCanvas.height);
         }
     }
-    
+
     /**
-     * カメラの位置を更新（最適化：matrixWorldNeedsUpdateを回避）
+     * Track1: カメラ用CameraParticleに「ランダムな力 + カメラ切替」を与える（共通）
+     * - velocity(0..127) で “ブースト量” を決める
+     * - durationMs の間だけ maxForce/maxSpeed を底上げして「ちゃんと動く」ようにする
+     *
+     * Scene側の想定:
+     * - this.cameraParticles: CameraParticle[]
+     * - this.currentCameraIndex: number
+     * - this.switchCameraRandom(): カメラ切替（Scene01/02は実装済み）
      */
-    updateCamera() {
-        if (this.cameraParticles[this.currentCameraIndex]) {
-            const cameraPos = this.cameraParticles[this.currentCameraIndex].getPosition();
-            this.camera.position.copy(cameraPos);
-            this.camera.lookAt(0, 0, 0);
-            // matrixWorldNeedsUpdateをfalseにして不要な再計算を回避
-            this.camera.matrixWorldNeedsUpdate = false;
+    applyTrack1CameraImpulse(velocity = 127, durationMs = 0) {
+        if (!this.trackEffects?.[1]) return;
+        const cps = this.cameraParticles;
+        if (!cps || cps.length === 0) return;
+
+        const v01 = Math.min(Math.max((Number(velocity) || 0) / 127, 0), 1);
+        // さらにさらに弱め（“まだ強い”対策）
+        // - maxForce: ほぼ上げない（= ランダムforceはmaxForceで強制的に小さくクランプされる）
+        // - maxSpeed: ほぼ固定
+        // 0.06..0.18
+        const forceMul = 0.06 + 0.12 * v01;
+        // 1.00..1.04
+        const speedMul = 1.00 + 0.04 * v01;
+        const now = Date.now();
+        // デフォは短め（長いと暴れが残りやすい）
+        const holdMs = Math.max(0, Number(durationMs) || 0) > 0 ? Number(durationMs) : 80;
+
+        cps.forEach((cp) => {
+            if (!cp) return;
+            // baseを初回だけ記録
+            if (typeof cp.__track1BaseMaxForce === 'undefined') cp.__track1BaseMaxForce = cp.maxForce;
+            if (typeof cp.__track1BaseMaxSpeed === 'undefined') cp.__track1BaseMaxSpeed = cp.maxSpeed;
+
+            // ブーストを設定（期限切れは updateTrack1CameraBoosts() が戻す）
+            cp.__track1BoostUntilMs = now + holdMs;
+            cp.maxForce = (Number(cp.__track1BaseMaxForce) || cp.maxForce) * forceMul;
+            cp.maxSpeed = (Number(cp.__track1BaseMaxSpeed) || cp.maxSpeed) * speedMul;
+
+            // 力をランダム化（方向/回転）
+            // NOTE: 強すぎる場合があるので “Weak” を優先
+            if (typeof cp.applyRandomForceWeak === 'function') {
+                cp.applyRandomForceWeak();
+            } else if (typeof cp.applyRandomForce === 'function') {
+                cp.applyRandomForce();
+            }
+        });
+
+        // カメラを切り替える（Scene側に実装があればそれを使う）
+        if (typeof this.switchCameraRandom === 'function') {
+            this.switchCameraRandom();
+        } else {
+            // fallback
+            if (typeof this.currentCameraIndex !== 'number') this.currentCameraIndex = 0;
+            if (cps.length >= 2) {
+                let idx = this.currentCameraIndex;
+                while (idx === this.currentCameraIndex) {
+                    idx = Math.floor(Math.random() * cps.length);
+                }
+                this.currentCameraIndex = idx;
+            }
         }
     }
-    
+
     /**
-     * 色収差エフェクトの更新（サスティン終了チェック）
+     * Track1: 期限切れのブーストを元に戻す（毎フレーム呼ばれる）
      */
-    updateChromaticAberration() {
-        if (this.chromaticAberrationPass && this.chromaticAberrationPass.enabled) {
-            // キーが押されている場合は無効化しない
-            if (this.chromaticAberrationKeyPressed) {
-                return;
+    updateTrack1CameraBoosts() {
+        const cps = this.cameraParticles;
+        if (!cps || cps.length === 0) return;
+        const now = Date.now();
+        cps.forEach((cp) => {
+            if (!cp) return;
+            const until = Number(cp.__track1BoostUntilMs || 0);
+            if (until > 0 && now >= until) {
+                if (typeof cp.__track1BaseMaxForce !== 'undefined') cp.maxForce = cp.__track1BaseMaxForce;
+                if (typeof cp.__track1BaseMaxSpeed !== 'undefined') cp.maxSpeed = cp.__track1BaseMaxSpeed;
+                cp.__track1BoostUntilMs = 0;
             }
-            
-            const currentTime = Date.now();
-            if (this.chromaticAberrationEndTime > 0 && currentTime >= this.chromaticAberrationEndTime) {
-                // サスティン終了
-                this.chromaticAberrationPass.enabled = false;
-                this.chromaticAberrationAmount = 0.0;
-                this.chromaticAberrationEndTime = 0;
-            }
-        }
-    }
-    
-    /**
-     * グリッチエフェクトの更新（サスティン終了チェックと時間更新）
-     */
-    updateGlitch() {
-        if (this.glitchPass && this.glitchPass.enabled) {
-            // 時間を更新
-            if (this.glitchPass.material && this.glitchPass.material.uniforms && this.glitchPass.material.uniforms.time) {
-                this.glitchPass.material.uniforms.time.value = this.time * 0.1;  // 時間をスケール
-            }
-            
-            // キーが押されている場合は無効化しない
-            if (this.glitchKeyPressed) {
-                return;
-            }
-            
-            const currentTime = Date.now();
-            if (this.glitchEndTime > 0 && currentTime >= this.glitchEndTime) {
-                // サスティン終了
-                this.glitchPass.enabled = false;
-                this.glitchAmount = 0.0;
-                this.glitchEndTime = 0;
-            }
-        }
+        });
     }
     
     /**
@@ -508,186 +892,120 @@ export class SceneBase {
     /**
      * 描画処理
      */
-    render() {
-        // 背景色を設定
-        if (this.backgroundWhite) {
-            this.renderer.setClearColor(0xffffff);
-        } else {
-            this.renderer.setClearColor(0x000000);
-        }
-        
-        // 色反転エフェクトが有効な場合はColorInversionのcomposerを使用
-        if (this.colorInversion && this.colorInversion.isEnabled()) {
-            // ColorInversionのcomposerがシーンをレンダリングして色反転を適用
-            const rendered = this.colorInversion.render();
-            if (!rendered) {
-                // レンダリングに失敗した場合は通常のレンダリング
-                if (this.scene) {
-                    this.renderer.render(this.scene, this.camera);
-                }
-            }
-        } else {
-            // ポストプロセッシングエフェクトが有効な場合はEffectComposerを使用
-            if (this.composer && 
-                ((this.chromaticAberrationPass && this.chromaticAberrationPass.enabled) ||
-                 (this.glitchPass && this.glitchPass.enabled))) {
-                this.composer.render();
-            } else {
-                // 通常のレンダリング
-                if (this.scene) {
-                    this.renderer.render(this.scene, this.camera);
-                }
-            }
-        }
-        
-        // HUDを描画（非表示の時はCanvasをクリア）
-        if (this.hud) {
-            if (this.showHUD) {
-                const cameraPos = this.cameraParticles[this.currentCameraIndex]?.getPosition() || new THREE.Vector3();
-                const now = performance.now();
-                const frameRate = this.lastFrameTime ? 1.0 / ((now - this.lastFrameTime) / 1000.0) : 60.0;
-                this.lastFrameTime = now;
-                
-                // 色反転エフェクトが有効な場合は、HUDの色も反転する
-                const isInverted = this.colorInversion && this.colorInversion.isEnabled();
-                
-                this.hud.display(
-                    frameRate,
-                    this.currentCameraIndex,
-                    cameraPos,
-                    0, // activeSpheres（サブクラスで設定）
-                    this.time, // time（サブクラスで設定）
-                    this.cameraParticles[this.currentCameraIndex]?.getRotationX() || 0,
-                    this.cameraParticles[this.currentCameraIndex]?.getRotationY() || 0,
-                    cameraPos.length(),
-                    0, // noiseLevel（サブクラスで設定）
-                    isInverted, // backgroundWhite（色反転エフェクトが有効な場合はtrue）
-                    this.oscStatus,
-                    this.particleCount,
-                    this.trackEffects  // エフェクト状態を渡す
-                );
-            } else {
-                // HUDが非表示の時はCanvasをクリア
-                this.hud.clear();
-            }
-        }
-        
-        // スクリーンショットテキストを描画
-        this.drawScreenshotText();
-        
-        // デバッグ用シーンを描画（エフェクト適用後、HUDと同じタイミング）
-        // カメラデバッグとAxesHelperはエフェクトから除外
-        // 一時的に無効化（問題が発生しているため）
-        // if (this.debugScene) {
-        //     this.renderer.render(this.debugScene, this.camera, null, false);
-        // }
-        
-        // カメラデバッグを描画（テキスト）
-        this.drawCameraDebug();
+    async render() {
+        // サブクラスで実装
     }
     
     /**
      * OSCメッセージのハンドリング
-     * @param {Object} message - OSCメッセージ
      */
     handleOSC(message) {
+        // phaseを受け取るための入口（OSC側の仕様が変わってもSceneBaseは受け口だけ提供）
+        // - message.phase があれば優先
+        // - /phase などのaddressで飛んでくる場合は args[0] を採用
+        if (typeof message?.phase !== 'undefined') {
+            this.setPhase(message.phase);
+        } else if (typeof message?.address === 'string' && message.address.includes('phase')) {
+            const v0 = message?.args?.[0];
+            if (typeof v0 !== 'undefined') {
+                this.setPhase(v0);
+            } else {
+                // /phase/3 みたいにaddressに値が埋まってるパターンも拾う
+                const m = message.address.match(/phase\/(-?\d+)/);
+                if (m) this.setPhase(Number(m[1]));
+            }
+        }
+        
+        // bar（小節）を受け取る処理（actual_barという名前で渡される）
+        if (typeof message?.actual_bar !== 'undefined') {
+            this.setBar(message.actual_bar);
+        } else if (typeof message?.bar !== 'undefined') {
+            this.setBar(message.bar);
+        } else if (typeof message?.address === 'string' && message.address.includes('bar')) {
+            const v0 = message?.args?.[0];
+            if (typeof v0 !== 'undefined') {
+                this.setBar(v0);
+            } else {
+                // /bar/3 みたいにaddressに値が埋まってるパターンも拾う
+                const m = message.address.match(/bar\/(-?\d+)/);
+                if (m) this.setBar(Number(m[1]));
+            }
+        }
+
+        // actual_tick（時間）を受け取る処理
+        if (typeof message?.actual_tick !== 'undefined') {
+            this.setTick(message.actual_tick);
+        } else if (typeof message?.tick !== 'undefined') {
+            this.setTick(message.tick);
+        } else if (typeof message?.address === 'string' && message.address.includes('tick')) {
+            const v0 = message?.args?.[0];
+            if (typeof v0 !== 'undefined') {
+                this.setTick(v0);
+            } else {
+                // /tick/1234 みたいにaddressに値が埋まってるパターンも拾う
+                const m = message.address.match(/tick\/(-?\d+)/);
+                if (m) this.setTick(Number(m[1]));
+            }
+        }
+
         const trackNumber = message.trackNumber;
         
-        // trackEffectsの状態をチェック（オフの場合は処理をスキップ）
+        // trackEffectsの状態をチェック
         if (trackNumber >= 1 && trackNumber <= 9 && !this.trackEffects[trackNumber]) {
-            console.log(`Track ${trackNumber}: オフのため処理をスキップ`);
             return;
         }
         
-        // トラック1: カメラをランダムに切り替え（全シーン共通）
-        if (trackNumber === 1) {
-            this.switchCameraRandom();
-            return;  // 処理済み
-        }
-        
-        // トラック2: 色反転エフェクト（OSCで制御、共通化）
-        if (trackNumber === 2) {
-            const args = message.args || [];
-            const velocity = args[0] || 127.0;
-            const durationMs = args[2] || 0.0;
-            if (this.colorInversion) {
-                // durationMsが0の場合はトグル動作（キー入力時）
-                if (durationMs === 0 && args.length === 0) {
-                    const currentState = this.colorInversion.isEnabled();
-                    this.colorInversion.setEnabled(!currentState);
-                    console.log(`Track 2: Color inversion ${!currentState ? 'ON' : 'OFF'}`);
-                } else {
-                    // durationMsが指定されている場合はapplyを使用（OSC時）
-                    this.colorInversion.apply(velocity, durationMs);
-                }
-            }
-            return;  // 処理済み
-        }
-        
-        // トラック3: 色収差エフェクト（共通化）
-        if (trackNumber === 3) {
-            const args = message.args || [];
-            const velocity = args[1] || 127.0;
-            const noteNumber = args[0] || 64.0;
-            const durationMs = args[2] || 0.0;
-            this.applyChromaticAberration(velocity, noteNumber, durationMs);
-            return;  // 処理済み
-        }
-        
-        // トラック4: グリッチエフェクト（共通化）
-        if (trackNumber === 4) {
-            const args = message.args || [];
-            const velocity = args[1] || 127.0;
-            const noteNumber = args[0] || 64.0;
-            const durationMs = args[2] || 0.0;
-            this.applyGlitch(velocity, noteNumber, durationMs);
-            return;  // 処理済み
-        }
-        
         // その他のトラックはサブクラスで処理
-        // サブクラスのOSC処理
         this.handleTrackNumber(trackNumber, message);
     }
-    
+
     /**
-     * キーダウン処理（全シーン共通）
-     * 注意: 数字キー1-9はtoggleEffect()で処理されるため、ここでは呼ばれない
-     * このメソッドは主にOSCメッセージからの呼び出し用
+     * actual_tick 更新（OSC/外部入力）
      */
-    handleKeyDown(trackNumber) {
-        // このメソッドは主にOSCメッセージからの呼び出し用
-        // 数字キー1-9はtoggleEffect()で処理される
+    setTick(nextTick) {
+        const tRaw = Number(nextTick);
+        if (!Number.isFinite(tRaw)) return;
+        const t = Math.max(0, Math.floor(tRaw));
+        const prev = this.actualTick || 0;
+        if (prev === t) return;
+        this.actualTick = t;
+        if (this.onTickChange) this.onTickChange(prev, t);
+        if (this.applyTickEffects) this.applyTickEffects(t);
+    }
+
+    /**
+     * tick変化フック（インターフェース）
+     */
+    onTickChange(prevTick, nextTick) {
+        // サブクラスで実装
+    }
+
+    /**
+     * tickをエフェクトに反映するフック（インターフェース）
+     */
+    applyTickEffects(tick) {
+        // サブクラスで実装
     }
     
     /**
-     * キーアップ処理（全シーン共通）
+     * bar（小節）更新（OSC/外部入力）
      */
-    handleKeyUp(trackNumber) {
-        // トラック2: 色反転エフェクト（キーが離されたら無効）
-        if (trackNumber === 2) {
-            if (this.colorInversion) {
-                this.colorInversion.setEnabled(false);
-                console.log('Track 2: Color inversion OFF');
-            }
-        }
-        // トラック3: 色収差エフェクト（キーが離されたら無効）
-        else if (trackNumber === 3) {
-            this.chromaticAberrationKeyPressed = false;
-            if (this.chromaticAberrationPass) {
-                this.chromaticAberrationPass.enabled = false;
-                this.chromaticAberrationAmount = 0.0;
-                this.chromaticAberrationEndTime = 0;
-            }
-        }
-        // トラック4: グリッチエフェクト（キーが離されたら無効）
-        else if (trackNumber === 4) {
-            this.glitchKeyPressed = false;
-            if (this.glitchPass) {
-                this.glitchPass.enabled = false;
-                this.glitchAmount = 0.0;
-                this.glitchEndTime = 0;
-            }
-        }
+    setBar(bar) {
+        const bRaw = Number(bar);
+        if (!Number.isFinite(bRaw) || bRaw < 1) return;
+        
+        const prev = this.currentBar || 0;
+        this.currentBar = Math.floor(bRaw);
+        
+        // サブクラスで処理
+        if (this.onBarChange) this.onBarChange(prev, this.currentBar);
+    }
+    
+    /**
+     * bar変化フック（インターフェース）
+     */
+    onBarChange(prevBar, nextBar) {
+        // サブクラスで実装
     }
     
     /**
@@ -699,278 +1017,85 @@ export class SceneBase {
     
     /**
      * エフェクトのオン/オフを切り替え（数字キー1-9用）
-     * @param {number} trackNumber - トラック番号（1-9）
      */
     toggleEffect(trackNumber) {
         if (trackNumber < 1 || trackNumber > 9) return;
         
-        // エフェクト状態を切り替え
         this.trackEffects[trackNumber] = !this.trackEffects[trackNumber];
-        const isOn = this.trackEffects[trackNumber];
-        
-        console.log(`Track ${trackNumber}: ${isOn ? 'ON' : 'OFF'}`);
-        
-        // 各トラックのエフェクトを実際に適用/解除
-        if (trackNumber === 1) {
-            // トラック1: カメラをランダムに切り替え（ONの時のみ実行）
-            if (isOn) {
-                this.switchCameraRandom();
-            }
-        } else if (trackNumber === 2) {
-            // 色反転エフェクト
-            if (this.colorInversion) {
-                this.colorInversion.setEnabled(isOn);
-            }
-        } else if (trackNumber === 3) {
-            // 色収差エフェクト
-            if (this.chromaticAberrationPass) {
-                this.chromaticAberrationPass.enabled = isOn;
-                if (!isOn) {
-                    this.chromaticAberrationAmount = 0.0;
-                    this.chromaticAberrationEndTime = 0;
-                    this.chromaticAberrationKeyPressed = false;
-                }
-            }
-        } else if (trackNumber === 4) {
-            // グリッチエフェクト
-            if (this.glitchPass) {
-                this.glitchPass.enabled = isOn;
-                if (!isOn) {
-                    this.glitchAmount = 0.0;
-                    this.glitchEndTime = 0;
-                    this.glitchKeyPressed = false;
-                }
-            }
-        }
-        // トラック5-9は各シーンで個別に処理（爆発、圧力など）
-        // サブクラスでhandleTrackNumber()をオーバーライドして処理
+        // NOTE:
+        // - ここでは「スイッチ状態」だけを管理する（自動で効果を発火させない）
+        // - 実際の発火（uniform更新など）はOSC受信時/Scene側の処理で行う
     }
-    
-    
+
     /**
-     * 背景を白にする
+     * phase更新（OSC/外部入力）
+     * - Scene側は onPhaseChange / applyPhaseEffects をオーバーライドしてエフェクトに使う
      */
-    setBackgroundWhite(white, endTime = null) {
-        this.backgroundWhite = white;
-        if (endTime !== null) {
-            this.backgroundWhiteEndTime = endTime;
-        }
+    setPhase(nextPhase) {
+        const pRaw = Number(nextPhase);
+        if (!Number.isFinite(pRaw)) return;
+        
+        // phaseは 0..9 の10ステップとして扱う（OSC側はループ前提）
+        const p = ((Math.floor(pRaw) % 10) + 10) % 10;
+        
+        const prev = this.phase;
+        if (prev === p) return;
+        this.phase = p;
+        if (this.onPhaseChange) this.onPhaseChange(prev, p);
+        if (this.applyPhaseEffects) this.applyPhaseEffects(p);
+    }
+
+    /**
+     * phase変化フック（インターフェース）
+     */
+    onPhaseChange(prevPhase, nextPhase) {
+        // サブクラスで実装
+    }
+
+    /**
+     * phaseをエフェクトに反映するフック（インターフェース）
+     */
+    applyPhaseEffects(phase) {
+        // サブクラスで実装
     }
     
     /**
-     * カメラをランダムに切り替える
+     * キーアップ処理（全シーン共通）
+     * 注意: エフェクトを即OFFではなく、スイッチをOFFにするだけ
      */
-    switchCameraRandom() {
-        let newIndex = this.currentCameraIndex;
-        while (newIndex === this.currentCameraIndex) {
-            newIndex = Math.floor(Math.random() * this.cameraParticles.length);
+    handleKeyUp(trackNumber) {
+        // トラック2,3,4はキーが離された時にスイッチをOFFにする
+        // ただし、エフェクト自体はdurationで自然に終わる（即OFFではない）
+        if (trackNumber === 2 || trackNumber === 3 || trackNumber === 4) {
+            this.trackEffects[trackNumber] = false;
         }
-        this.currentCameraIndex = newIndex;
-        
-        // 8個全部のカメラにランダムな力を加える
-        console.log(`switchCameraRandom: Applying random force to all ${this.cameraParticles.length} camera particles`);
-        this.cameraParticles.forEach((cp, index) => {
-            cp.applyRandomForce();
-            console.log(`  - Camera particle #${index + 1}: force applied`);
-        });
-        
-        console.log(`Camera switched to index: ${this.currentCameraIndex}`);
     }
     
     /**
      * リセット処理
      */
     reset() {
-        // TIMEをリセット（エフェクトはそのまま）
         if (this.hud && this.hud.resetTime) {
             this.hud.resetTime();
         }
-        
-        // サブクラスで実装
-    }
-    
-    /**
-     * クリーンアップ処理（シーン切り替え時に呼ばれる）
-     * Three.jsのオブジェクトを破棄してメモリリークを防ぐ
-     */
-    dispose() {
-        console.log('SceneBase.dispose: クリーンアップ開始');
-        
-        // シーン内のすべてのオブジェクトを破棄
-        if (this.scene) {
-            this.scene.traverse((object) => {
-                // ジオメトリを破棄
-                if (object.geometry) {
-                    object.geometry.dispose();
-                }
-                
-                // マテリアルを破棄
-                if (object.material) {
-                    if (Array.isArray(object.material)) {
-                        object.material.forEach(material => material.dispose());
-                    } else {
-                        object.material.dispose();
-                    }
-                }
-                
-                // テクスチャを破棄
-                if (object.material && object.material.map) {
-                    object.material.map.dispose();
-                }
-            });
-            
-            // シーンをクリア
-            while (this.scene.children.length > 0) {
-                this.scene.remove(this.scene.children[0]);
-            }
-        }
-        
-        // デバッグシーンも同様にクリア
-        if (this.debugScene) {
-            while (this.debugScene.children.length > 0) {
-                this.debugScene.remove(this.debugScene.children[0]);
-            }
-        }
-        
-        // カメラデバッググループをクリア
-        if (this.cameraDebugGroup) {
-            while (this.cameraDebugGroup.children.length > 0) {
-                this.cameraDebugGroup.remove(this.cameraDebugGroup.children[0]);
-            }
-        }
-        
-        // EffectComposerを破棄
-        if (this.composer) {
-            this.composer.dispose();
-            this.composer = null;
-        }
-        
-        // ColorInversionを破棄
-        if (this.colorInversion && this.colorInversion.dispose) {
-            this.colorInversion.dispose();
-            this.colorInversion = null;
-        }
-        
-        // カメラデバッグ用Canvasを削除
-        if (this.cameraDebugCanvas && this.cameraDebugCanvas.parentElement) {
-            this.cameraDebugCanvas.parentElement.removeChild(this.cameraDebugCanvas);
-            this.cameraDebugCanvas = null;
-            this.cameraDebugCtx = null;
-        }
-        
-        // スクリーンショット用Canvasを削除
-        if (this.screenshotCanvas && this.screenshotCanvas.parentElement) {
-            this.screenshotCanvas.parentElement.removeChild(this.screenshotCanvas);
-            this.screenshotCanvas = null;
-            this.screenshotCtx = null;
-        }
-        
-        // 配列をクリア
-        this.cameraDebugSpheres = [];
-        this.cameraDebugLines = [];
-        this.cameraDebugCircles = [];
-        this.cameraDebugTextPositions = [];
-        
-        console.log('SceneBase.dispose: クリーンアップ完了');
-        
-        // サブクラスで追加のクリーンアップ処理を実装可能
-    }
-    
-    /**
-     * 色収差エフェクトを適用（ノート、ベロシティ、デュレーション付き）
-     */
-    applyChromaticAberration(velocity, noteNumber, durationMs) {
-        if (!this.chromaticAberrationPass) {
-            console.warn('色収差エフェクトが初期化されていません');
-            return;
-        }
-        
-        // ベロシティ（0〜127）を色収差の強度（0.0〜1.0）に変換
-        // ベロシティが大きいほど強度が高い
-        const amount = THREE.MathUtils.mapLinear(velocity, 0, 127, 0.0, 1.0);
-        this.chromaticAberrationAmount = amount;
-        
-        // シェーダーのuniformを更新
-        if (this.chromaticAberrationPass.material && this.chromaticAberrationPass.material.uniforms) {
-            this.chromaticAberrationPass.material.uniforms.amount.value = amount;
-        }
-        
-        // エフェクトを有効化
-        this.chromaticAberrationPass.enabled = true;
-        
-        // デュレーション（サスティン）を設定
-        if (durationMs > 0) {
-            this.chromaticAberrationEndTime = Date.now() + durationMs;
-        } else {
-            // デュレーションが0の場合は無期限（キーが離されるまで）
-            this.chromaticAberrationEndTime = 0;
-        }
-        
-        console.log(`Track 3: Chromatic aberration applied (velocity: ${velocity}, note: ${noteNumber}, amount: ${amount.toFixed(2)}, duration: ${durationMs}ms)`);
-    }
-    
-    /**
-     * グリッチエフェクトを適用（ノート、ベロシティ、デュレーション付き）
-     */
-    applyGlitch(velocity, noteNumber, durationMs) {
-        if (!this.glitchPass) {
-            console.warn('グリッチエフェクトが初期化されていません');
-            return;
-        }
-        
-        // ベロシティ（0〜127）をグリッチの強度（0.0〜1.0）に変換
-        // ベロシティが大きいほど強度が高い
-        const amount = THREE.MathUtils.mapLinear(velocity, 0, 127, 0.0, 1.0);
-        this.glitchAmount = amount;
-        
-        // シェーダーのuniformを更新
-        if (this.glitchPass.material && this.glitchPass.material.uniforms) {
-            this.glitchPass.material.uniforms.amount.value = amount;
-        }
-        
-        // エフェクトを有効化
-        this.glitchPass.enabled = true;
-        
-        // デュレーション（サスティン）を設定
-        if (durationMs > 0) {
-            this.glitchEndTime = Date.now() + durationMs;
-        } else {
-            // デュレーションが0の場合は無期限（キーが離されるまで）
-            this.glitchEndTime = 0;
-        }
-        
-        console.log(`Track 4: Glitch effect applied (velocity: ${velocity}, note: ${noteNumber}, amount: ${amount.toFixed(2)}, duration: ${durationMs}ms)`);
     }
     
     /**
      * リサイズ処理
      */
     onResize() {
-        // 色反転エフェクトのリサイズ
-        if (this.colorInversion) {
-            this.colorInversion.onResize();
+        if (this.camera) {
+            this.camera.aspect = window.innerWidth / window.innerHeight;
+            this.camera.updateProjectionMatrix();
         }
-        
-        // ポストプロセッシングエフェクトのリサイズ
-        if (this.composer) {
-            this.composer.setSize(window.innerWidth, window.innerHeight);
+        if (this.hud) {
+            this.hud.updateSize();
         }
-        
-        // サブクラスで実装
-    }
-    
-    /**
-     * OSC状態を設定
-     */
-    setOSCStatus(status) {
-        this.oscStatus = status;
-    }
-    
-    /**
-     * パーティクル数を設定
-     */
-    setParticleCount(count) {
-        this.particleCount = count;
+        if (this.cameraDebugCanvas) {
+            this.cameraDebugCanvas.width = window.innerWidth;
+            this.cameraDebugCanvas.height = window.innerHeight;
+        }
+        this.resizeScreenshotCanvas();
     }
     
     /**
@@ -1276,287 +1401,52 @@ export class SceneBase {
     }
     
     /**
-     * リサイズ処理（オーバーライド用）
+     * OSC状態を設定
      */
-    onResize() {
-        this.resizeScreenshotCanvas();
-        
-        // カメラデバッグ用Canvasをリサイズ
-        if (this.cameraDebugCanvas) {
-            this.cameraDebugCanvas.width = window.innerWidth;
-            this.cameraDebugCanvas.height = window.innerHeight;
-        }
+    setOSCStatus(status) {
+        this.oscStatus = status;
     }
     
     /**
-     * キー入力処理（c/Cキーでカメラデバッグ表示を切り替え、またはカメラを切り替え）
+     * パーティクル数を設定
      */
-    handleKeyPress(key) {
-        if (key === 'c' || key === 'C') {
-            // 小文字のc: カメラデバッグ表示を切り替え
-            if (key === 'c') {
-                this.SHOW_CAMERA_DEBUG = !this.SHOW_CAMERA_DEBUG;
-                console.log(`Camera debug: ${this.SHOW_CAMERA_DEBUG ? 'ON' : 'OFF'}`);
-                
-                // カメラデバッググループの表示/非表示を切り替え
-                if (this.cameraDebugGroup) {
-                    this.cameraDebugGroup.visible = this.SHOW_CAMERA_DEBUG;
-                }
-                
-                // 座標軸も連動させる
-                this.SHOW_AXES = this.SHOW_CAMERA_DEBUG;
-                if (this.axesHelper) {
-                    this.axesHelper.visible = this.SHOW_AXES;
-                }
-            }
-            // 大文字のC: カメラを切り替え
-            else if (key === 'C') {
-                this.currentCameraIndex = (this.currentCameraIndex + 1) % this.cameraParticles.length;
-                console.log(`Camera switched to #${this.currentCameraIndex + 1}`);
-            }
-        }
-        // aキー: 座標軸（AxesHelper）の表示/非表示を切り替え
-        else if (key === 'a' || key === 'A') {
-            this.SHOW_AXES = !this.SHOW_AXES;
-            if (this.axesHelper) {
-                this.axesHelper.visible = this.SHOW_AXES;
-            }
-            console.log(`Axes helper: ${this.SHOW_AXES ? 'ON' : 'OFF'}`);
-        }
+    setParticleCount(count) {
+        this.particleCount = count;
     }
     
     /**
-     * カメラデバッグ用オブジェクトを初期化
+     * リソースの有効/無効を切り替え（update/レンダリングのスキップ制御）
      */
-    initCameraDebugObjects() {
-        if (!this.cameraDebugGroup) return;
-        
-        // 各カメラパーティクル用のSphereとLineを作成
-        for (let i = 0; i < this.cameraParticles.length; i++) {
-            // 赤いSphere（塗りつぶし、ライティングあり）
-            const sphereSize = 15;  // 大きく（5 → 15）
-            const sphereGeometry = new THREE.SphereGeometry(sphereSize, 32, 32);
-            const sphereMaterial = new THREE.MeshStandardMaterial({
-                color: 0xff0000,  // 赤
-                transparent: true,
-                opacity: 0.8,
-                emissive: 0x330000,  // 発光色（控えめ）
-                emissiveIntensity: 0.2,
-                roughness: 0.8,
-                metalness: 0.0
-            });
-            const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
-            sphere.visible = false;
-            this.cameraDebugGroup.add(sphere);
-            this.cameraDebugSpheres.push(sphere);
-            
-            // 周囲のCircle（3つの方向に配置）
-            // Circleの大きさは固定（SphereとCircleの間を太くするため）
-            const circleRadius = 30;  // 大きく（12 → 30）して見やすくする
-            const circleSegments = 32;
-            
-            // X-Y平面のCircle（前回より少し細く：0.9 → 0.94）
-            const circleXYGeometry = new THREE.RingGeometry(circleRadius * 0.94, circleRadius, circleSegments);
-            const circleXYMaterial = new THREE.MeshBasicMaterial({
-                color: 0xff0000,  // 赤
-                transparent: true,
-                opacity: 1.0,  // 0.6 → 1.0（見やすくする）
-                side: THREE.DoubleSide,
-                depthWrite: false  // 深度書き込みを無効化（透明なオブジェクトの描画順の問題を回避）
-            });
-            const circleXY = new THREE.Mesh(circleXYGeometry, circleXYMaterial);
-            circleXY.rotation.x = -Math.PI / 2;  // X-Y平面に配置
-            circleXY.visible = false;
-            circleXY.renderOrder = 1000;  // 描画順を後ろに（他のオブジェクトの上に描画）
-            this.cameraDebugGroup.add(circleXY);
-            
-            // X-Z平面のCircle（前回より少し細く：0.9 → 0.94）
-            const circleXZGeometry = new THREE.RingGeometry(circleRadius * 0.94, circleRadius, circleSegments);
-            const circleXZMaterial = new THREE.MeshBasicMaterial({
-                color: 0xff0000,  // 赤
-                transparent: true,
-                opacity: 1.0,  // 0.6 → 1.0（見やすくする）
-                side: THREE.DoubleSide,
-                depthWrite: false  // 深度書き込みを無効化
-            });
-            const circleXZ = new THREE.Mesh(circleXZGeometry, circleXZMaterial);
-            circleXZ.visible = false;
-            circleXZ.renderOrder = 1000;  // 描画順を後ろに
-            this.cameraDebugGroup.add(circleXZ);
-            
-            // Y-Z平面のCircle（前回より少し細く：0.9 → 0.94）
-            const circleYZGeometry = new THREE.RingGeometry(circleRadius * 0.94, circleRadius, circleSegments);
-            const circleYZMaterial = new THREE.MeshBasicMaterial({
-                color: 0xff0000,  // 赤
-                transparent: true,
-                opacity: 1.0,  // 0.6 → 1.0（見やすくする）
-                side: THREE.DoubleSide,
-                depthWrite: false  // 深度書き込みを無効化
-            });
-            const circleYZ = new THREE.Mesh(circleYZGeometry, circleYZMaterial);
-            circleYZ.rotation.y = Math.PI / 2;  // Y-Z平面に配置
-            circleYZ.visible = false;
-            circleYZ.renderOrder = 1000;  // 描画順を後ろに
-            this.cameraDebugGroup.add(circleYZ);
-            
-            this.cameraDebugCircles.push([circleXY, circleXZ, circleYZ]);
-            
-            // デバッグ: Circleが正しく作成されたか確認
-            if (i === 0) {
-                console.log(`initCameraDebugObjects: Created circles for camera particle #${i + 1}`, {
-                    circleXY: !!circleXY,
-                    circleXZ: !!circleXZ,
-                    circleYZ: !!circleYZ,
-                    circlesArray: this.cameraDebugCircles[i]
-                });
-            }
-            
-            // 中心への赤い線を作成
-            const lineGeometry = new THREE.BufferGeometry();
-            const lineMaterial = new THREE.LineBasicMaterial({
-                color: 0xff0000,  // 赤
-                transparent: true,
-                opacity: 0.6
-            });
-            const line = new THREE.Line(lineGeometry, lineMaterial);
-            line.visible = false;
-            this.cameraDebugGroup.add(line);
-            this.cameraDebugLines.push(line);
-        }
-        
-        this.cameraDebugGroup.visible = this.SHOW_CAMERA_DEBUG;
+    setResourceActive(active) {
+        // サブクラスで実装
     }
     
     /**
-     * カメラデバッグを描画
+     * シーン固有の要素をクリーンアップ
      */
-    drawCameraDebug() {
-        // Canvasをクリア（SHOW_CAMERA_DEBUGがfalseの時もクリアする）
-        if (this.cameraDebugCtx && this.cameraDebugCanvas) {
-            this.cameraDebugCtx.clearRect(0, 0, this.cameraDebugCanvas.width, this.cameraDebugCanvas.height);
+    cleanupSceneSpecificElements() {
+        // サブクラスで実装
+    }
+    
+    /**
+     * クリーンアップ処理（シーン切り替え時に呼ばれる）
+     */
+    dispose() {
+        // スクリーンショット用Canvasを削除
+        if (this.screenshotCanvas && this.screenshotCanvas.parentElement) {
+            this.screenshotCanvas.parentElement.removeChild(this.screenshotCanvas);
+            this.screenshotCanvas = null;
+            this.screenshotCtx = null;
+        }
+
+        // カメラデバッグ用Canvasを削除
+        if (this.cameraDebugCanvas && this.cameraDebugCanvas.parentElement) {
+            this.cameraDebugCanvas.parentElement.removeChild(this.cameraDebugCanvas);
+            this.cameraDebugCanvas = null;
+            this.cameraDebugCtx = null;
         }
         
-        if (!this.SHOW_CAMERA_DEBUG || !this.cameraDebugGroup) return;
-        
-        // 中心位置を取得（サブクラスでオーバーライド可能）
-        const center = this.getCameraDebugCenter ? this.getCameraDebugCenter() : new THREE.Vector3(0, 0, 0);
-        
-        // 各カメラパーティクルを描画
-        for (let i = 0; i < this.cameraParticles.length; i++) {
-            const cp = this.cameraParticles[i];
-            const pos = cp.getPosition();
-            
-            // Sphereを更新
-            if (i < this.cameraDebugSpheres.length) {
-                const sphere = this.cameraDebugSpheres[i];
-                sphere.position.copy(pos);
-                sphere.visible = true;
-            }
-            
-            // 周囲のCircleを更新（スケールも確実に1.0に設定）
-            // SHOW_CAMERA_DEBUG_CIRCLESフラグで制御
-            if (this.SHOW_CAMERA_DEBUG_CIRCLES && i < this.cameraDebugCircles.length) {
-                const circles = this.cameraDebugCircles[i];
-                if (circles && Array.isArray(circles)) {
-                    circles.forEach((circle, circleIndex) => {
-                        if (circle) {
-                            circle.position.copy(pos);
-                            circle.scale.set(1.0, 1.0, 1.0);  // スケールを確実に1.0に設定（巨大化を防ぐ）
-                            circle.visible = true;
-                            
-                            // マテリアルのopacityも確認
-                            if (circle.material) {
-                                circle.material.opacity = 1.0;  // 確実に不透明に
-                                circle.material.needsUpdate = true;
-                            }
-                        } else {
-                            console.warn(`drawCameraDebug: Camera particle #${i + 1}, circle #${circleIndex} is null`);
-                        }
-                    });
-                } else {
-                    console.warn(`drawCameraDebug: Camera particle #${i + 1} has invalid circles array`, circles);
-                }
-            } else if (i < this.cameraDebugCircles.length) {
-                // SHOW_CAMERA_DEBUG_CIRCLESがfalseの場合はCircleを非表示
-                const circles = this.cameraDebugCircles[i];
-                if (circles && Array.isArray(circles)) {
-                    circles.forEach((circle) => {
-                        if (circle) {
-                            circle.visible = false;
-                        }
-                    });
-                }
-            }
-            
-            // 中心への線を更新
-            if (i < this.cameraDebugLines.length) {
-                const line = this.cameraDebugLines[i];
-                if (line && line.geometry) {
-                    const positions = new Float32Array([
-                        pos.x, pos.y, pos.z,
-                        center.x, center.y, center.z
-                    ]);
-                    line.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                    line.geometry.attributes.position.needsUpdate = true;
-                    line.visible = true;
-                } else {
-                    console.warn(`drawCameraDebug: Camera particle #${i + 1} has no line or line.geometry`);
-                }
-            }
-            
-            // テキストを描画（位置を安定させるため、前フレームの位置を保持）
-            if (this.cameraDebugCtx && this.cameraDebugCanvas) {
-                const vector = pos.clone();
-                vector.project(this.camera);
-                
-                const x = (vector.x * 0.5 + 0.5) * this.cameraDebugCanvas.width;
-                const y = (-vector.y * 0.5 + 0.5) * this.cameraDebugCanvas.height;
-                
-                // 画面外や背面の場合は描画しない
-                if (x >= 0 && x <= this.cameraDebugCanvas.width && y >= 0 && y <= this.cameraDebugCanvas.height && vector.z < 1.0 && vector.z > -1.0) {
-                    // 位置が急激に変化する場合は描画をスキップ（ちらつき防止）
-                    if (!this.cameraDebugTextPositions) {
-                        this.cameraDebugTextPositions = [];
-                    }
-                    if (!this.cameraDebugTextPositions[i]) {
-                        this.cameraDebugTextPositions[i] = { x, y };
-                    }
-                    
-                    // 前フレームとの距離を計算
-                    const prevPos = this.cameraDebugTextPositions[i];
-                    const dx = x - prevPos.x;
-                    const dy = y - prevPos.y;
-                    const distance = Math.sqrt(dx * dx + dy * dy);
-                    
-                    // 急激な変化（100px以上）の場合は描画をスキップ
-                    if (distance < 100) {
-                        // スムーズに補間（前フレームの位置と現在の位置を混ぜる）
-                        const smoothX = prevPos.x * 0.3 + x * 0.7;
-                        const smoothY = prevPos.y * 0.3 + y * 0.7;
-                        
-                        this.cameraDebugCtx.save();
-                        this.cameraDebugCtx.fillStyle = 'white';  // 白
-                        this.cameraDebugCtx.font = '16px monospace';
-                        this.cameraDebugCtx.textAlign = 'center';
-                        this.cameraDebugCtx.textBaseline = 'bottom';
-                        
-                        // カメラ番号と座標を表示
-                        const cameraText = `camera #${i + 1}`;
-                        const coordText = `(${Math.round(pos.x)}, ${Math.round(pos.y)}, ${Math.round(pos.z)})`;
-                        this.cameraDebugCtx.fillText(cameraText, smoothX, smoothY - 80);
-                        this.cameraDebugCtx.fillText(coordText, smoothX, smoothY - 60);
-                        
-                        this.cameraDebugCtx.restore();
-                        
-                        // 位置を更新
-                        this.cameraDebugTextPositions[i] = { x: smoothX, y: smoothY };
-                    } else {
-                        // 急激な変化の場合は位置だけ更新（描画はスキップ）
-                        this.cameraDebugTextPositions[i] = { x, y };
-                    }
-                }
-            }
-        }
+        // サブクラスで実装
     }
 }
 

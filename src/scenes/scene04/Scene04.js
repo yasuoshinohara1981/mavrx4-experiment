@@ -1,1031 +1,603 @@
 /**
- * Scene04: 1000x1000のTerrain表示
+ * Scene04 (WebGPU): Terrain only
+ *
+ * シンプルなTerrainを表示するシーン（CPU頂点計算方式）
  */
+import { SceneTemplate } from '../SceneTemplate.js';
+import * as THREE from "three/webgpu";
+import { GridRuler3D } from '../../lib/GridRuler3D.js';
 
-import { SceneBase } from '../SceneBase.js';
-import { GPUParticleSystem } from '../../lib/GPUParticleSystem.js';
-import { Scene04_PunchSphere } from './Scene04_PunchSphere.js';
-import * as THREE from 'three';
+export class Scene04 extends SceneTemplate {
+    constructor(renderer, camera, sharedResourceManager = null) {
+        super(renderer, camera, sharedResourceManager);
+        this.title = 'mathym | coalesce (Sky)';
 
-export class Scene04 extends SceneBase {
-    constructor(renderer, camera) {
-        super(renderer, camera);
-        this.title = 'mathym | drmsh';
-        console.log('Scene04: コンストラクタ実行', this.title);
+        // トラックのON/OFF
+        this.trackEffects = {
+            1: true,   // カメラランダマイズ
+            2: true,   // invert
+            3: true,   // chroma
+            4: true,   // glitch
+            5: false,
+            6: false,
+            7: false,
+            8: false,
+            9: false,
+        };
+
+        this.terrainMesh = null;
         
-        // 表示設定
-        this.SHOW_PARTICLES = true;
-        this.SHOW_LINES = true;  // 線描画（オン）
+        // カメラパーティクル（Track1用）
+        this.cameraParticles = [];
+        this.currentCameraIndex = 0;
+        this.cameraCenter = new THREE.Vector3(0, 0, 0);
         
-        // グリッド設定（1000x1000の100万パーティクル）
-        this.cols = 1000;
-        this.rows = 1000;
-        this.scl = 5;  // スケール
-        this.w = this.cols * this.scl;  // 5000
-        this.h = this.rows * this.scl;  // 5000
-        
-        // GPUパーティクルシステム
-        this.gpuParticleSystem = null;
-        
-        // 線描画用
-        this.lineSystem = null;
-        
-        // ノイズパラメータ
-        this.noiseScale = 0.0001;  // 1/100に変更（0.0005 → 0.000005）
-        this.noiseStrength = 0.75;
-        this.time = 0.0;
-        this.timeIncrement = 0.006;
-        
-        // ノイズシード
-        this.noiseSeed = Math.random() * 10000.0;
-        
-        // ノイズオフセットテクスチャ
-        this.noiseOffsetTexture = null;
-        
-        // 地形の回転角度（回転なし）
-        this.terrainRotationX = 0;
-        
-        // 圧力（PunchSphere）のパラメータ
-        this.punchSpheres = [];
-        this.pendingSpheres = [];
-        this.punchDecay = 0.92;
-        
-        // 力の発生範囲（Processing版と同じ、地面の範囲内）
-        this.punchXMin = 0.2;
-        this.punchXMax = 0.8;
-        this.punchYMin = 0.2;
-        this.punchYMax = 0.8;
-        this.punchZMin = -300.0;
-        this.punchZMax = -150.0;
-        // 圧力を浅くする（強さを小さく）
-        this.punchStrengthMin = 5.0;   // 10.0 → 5.0
-        this.punchStrengthMax = 25.0;  // 60.0 → 25.0
-        // 圧力の範囲を広くする（半径を大きく）
-        this.punchRadiusMin = 600.0;   // 300.0 → 600.0
-        this.punchRadiusMax = 1500.0;  // 800.0 → 1500.0
-        
-        // グループ
-        this.sphereGroup = null;
-        
-        // テキスト表示用Canvas
-        this.scopeCanvas = null;
-        this.scopeCtx = null;
-        
-        // スクリーンショット用テキスト
-        this.setScreenshotText(this.title);
-        
-        // トラック4（グリッチエフェクト）をオフにする
-        this.trackEffects[4] = false;
+        // グリッド表示（gキーでトグル）
+        this.SHOW_WORLD_GRID = false; // デフォルトOFF
+        this.worldGrid = null;
     }
-    
+
     async setup() {
-        // 親クラスのsetup()を呼ぶ
         await super.setup();
-        
-        // カメラパーティクルの距離パラメータを再設定（親クラスで設定された後に上書き）
-        if (this.cameraParticles) {
-            for (const cameraParticle of this.cameraParticles) {
-                this.setupCameraParticleDistance(cameraParticle);
-            }
+
+        // シーン固有のシャドウ設定（conf.jsに依存せず、シーンごとに独立）
+        // Scene04: シャドウ無効（Terrainが大きすぎてパフォーマンスに影響するため）
+        this._shadowMapEnabled = false;
+        this._shadowMapType = THREE.PCFSoftShadowMap;
+        this.renderer.shadowMap.enabled = this._shadowMapEnabled;
+        this.renderer.shadowMap.type = this._shadowMapType;
+
+        // 背景は削除
+        this.scene.background = null;
+        this.scene.fog = null;
+
+        // HDRI環境の強度を上げてライトを明るくする
+        if (this.hdriTexture) {
+            this.applyHdriEnvironment(this.hdriTexture, {
+                envIntensity: 2.0, // 環境マップの強度を上げる
+                exposure: 1.5, // 露出を上げる
+            });
         }
-        
-        // 初期カメラを設定
-        this.setupCamera();
-        
-        // ライトを追加
-        this.setupLights();
-        
-        // GPUパーティクルシステムを初期化
-        const particleCount = this.cols * this.rows;
-        this.gpuParticleSystem = new GPUParticleSystem(
-            this.renderer,
-            particleCount,
-            this.cols,
-            this.rows,
-            0,  // baseRadiusは使用しない（地形なので）
-            'scene04'  // シェーダーパス
-        );
-        
-        // シェーダーの読み込み完了を待つ
-        await this.gpuParticleSystem.initPromise;
-        console.log('Scene04: GPUParticleSystem初期化完了');
-        
-        // パーティクルシステムをシーンに追加
-        const particleSystem = this.gpuParticleSystem.getParticleSystem();
-        if (particleSystem) {
-            particleSystem.visible = this.SHOW_PARTICLES;
-            this.scene.add(particleSystem);
-        
-            // パーティクルマテリアルを透明にする（地形用）
-            if (this.gpuParticleSystem.particleMaterial) {
-                this.gpuParticleSystem.particleMaterial.transparent = true;
-                this.gpuParticleSystem.particleMaterial.depthWrite = false;
-            }
-            
-            // パーティクルサイズを大きくする（地形用）
-            const sizeAttribute = this.gpuParticleSystem.particleGeometry.getAttribute('size');
-            if (sizeAttribute) {
-                const sizes = sizeAttribute.array;
-                for (let i = 0; i < sizes.length; i++) {
-                    sizes[i] = 10.0;  // 地形用にサイズを大きく（5.0 → 10.0）
-                }
-                sizeAttribute.needsUpdate = true;
-            }
-        }
-        
-        // パーティクル数を設定
-        this.setParticleCount(particleCount);
-        
-        // 初期位置データを設定
-        this.initializeParticleData();
-        
-        // 初期色を計算
-        this.updateInitialColors();
-        
-        // グループを作成
-        this.sphereGroup = new THREE.Group();
-        this.scene.add(this.sphereGroup);
-        
-        // テキスト表示用Canvasを初期化
-        this.scopeCanvas = document.createElement('canvas');
-        this.scopeCanvas.width = window.innerWidth;
-        this.scopeCanvas.height = window.innerHeight;
-        this.scopeCanvas.style.position = 'absolute';
-        this.scopeCanvas.style.top = '0';
-        this.scopeCanvas.style.left = '0';
-        this.scopeCanvas.style.pointerEvents = 'none';
-        this.scopeCanvas.style.zIndex = '1000';
-        this.scopeCtx = this.scopeCanvas.getContext('2d');
-        this.scopeCtx.font = '14px monospace';
-        this.scopeCtx.textAlign = 'center';
-        this.scopeCtx.textBaseline = 'top';
-        document.body.appendChild(this.scopeCanvas);
-        
-        // 線描画システムを作成
-        this.createLineSystem();
-    }
-    
-    /**
-     * ライトを設定
-     */
-    setupLights() {
-        // 環境光
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+
+        // カメラ設定（Terrainが大きいので、もっと遠くから見る）
+        this.camera.fov = 60;
+        this.camera.near = 0.01;
+        this.camera.far = 5000; // 160 -> 5000（Terrainが大きいので遠くまで見えるように）
+        this.camera.aspect = window.innerWidth / window.innerHeight;
+        this.camera.position.set(0, 120, 100); // カメラを上から見下ろす位置に（高く設定：50 -> 120）
+        this.camera.lookAt(0, 0, 0);
+        this.camera.updateProjectionMatrix();
+
+        // ライト（全体的に均等に照らすように調整）
+        // AmbientLightを強めにして、全体的に明るくする
+        const ambientLight = new THREE.AmbientLight(0xffffff, 1.5);
         this.scene.add(ambientLight);
         
-        // 指向性ライト
-        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-        directionalLight.position.set(1000, 2000, 1000);
-            this.scene.add(directionalLight);
-    }
-    
-    /**
-     * 初期パーティクルデータを設定（グリッド状に配置）
-     */
-    initializeParticleData() {
-        if (!this.gpuParticleSystem) return;
+        // メインのDirectionalLight（上から照らす）
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        directionalLight.position.set(0, 200, 0);
+        directionalLight.castShadow = false;
+        directionalLight.target.position.set(0, 0, 0);
+        this.scene.add(directionalLight.target);
+        this.scene.add(directionalLight);
         
-        const width = this.cols;
-        const height = this.rows;
-        const dataSize = width * height * 4;
-        const positionData = new Float32Array(dataSize);
-        const colorData = new Float32Array(dataSize);
-        const noiseOffsetData = new Float32Array(dataSize);
+        // 補助ライト（斜めから照らして立体感を出す）
+        const directionalLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
+        directionalLight2.position.set(200, 100, 200);
+        directionalLight2.castShadow = false;
+        directionalLight2.target.position.set(0, 0, 0);
+        this.scene.add(directionalLight2.target);
+        this.scene.add(directionalLight2);
         
-            for (let y = 0; y < height; y++) {
-                for (let x = 0; x < width; x++) {
-                    const index = (y * width + x) * 4;
-                    // 地形の中心を画面の中心（0, 0, 0）に合わせる
-                    const px = (x - width / 2) * this.scl;
-                    const py = (y - height / 2) * this.scl;
-                
-                // ノイズオフセットデータ（更新時用、各パーティクルで異なる値）
-                const noiseOffsetX = Math.random() * 10000.0;
-                const noiseOffsetY = Math.random() * 10000.0;
-                const noiseOffsetZ = Math.random() * 10000.0;
-                
-                // 初期化時のZ値をノイズで計算
-                // noiseScaleを使うように変更（0.1は元のnoiseScale=0.0005の時の値）
-                // 0.1 / 0.0005 = 200 なので、noiseScale * 200で元のスケールを維持
-                const noiseX = x * this.noiseScale * 200.0;
-                const noiseY = y * this.noiseScale * 200.0;
-                const pz = this.map(this.noise(noiseX, noiseY), 0, 1, -100, 100);
-                
-                // 位置データ（基準位置のZをwに保存）
-                positionData[index] = px;
-                positionData[index + 1] = py;
-                positionData[index + 2] = pz;
-                positionData[index + 3] = pz;  // 基準位置のZ
-                
-                // 色データ（初期色、明るくする）
-                colorData[index] = 0.8;  // 0.5 → 0.8（明るく）
-                colorData[index + 1] = 0.8;  // 0.5 → 0.8（明るく）
-                colorData[index + 2] = 0.8;  // 0.5 → 0.8（明るく）
-                colorData[index + 3] = 1.0;
-                
-                // ノイズオフセットデータを保存
-                noiseOffsetData[index] = noiseOffsetX;
-                noiseOffsetData[index + 1] = noiseOffsetY;
-                noiseOffsetData[index + 2] = noiseOffsetZ;
-                noiseOffsetData[index + 3] = 0.0;
-            }
-        }
-        
-        // RenderTargetにデータを書き込む
-        const positionTexture = new THREE.DataTexture(
-            positionData,
-            width,
-            height,
-            THREE.RGBAFormat,
-            THREE.FloatType
-        );
-        positionTexture.needsUpdate = true;
-        
-        const colorTexture = new THREE.DataTexture(
-            colorData,
-            width,
-            height,
-            THREE.RGBAFormat,
-            THREE.FloatType
-        );
-        colorTexture.needsUpdate = true;
-        
-        // ノイズオフセットテクスチャを作成
-        this.noiseOffsetTexture = new THREE.DataTexture(
-            noiseOffsetData,
-            width,
-            height,
-            THREE.RGBAFormat,
-            THREE.FloatType
-        );
-        this.noiseOffsetTexture.needsUpdate = true;
-        
-        // RenderTargetにコピー
-        this.gpuParticleSystem.copyTextureToRenderTarget(positionTexture, this.gpuParticleSystem.positionRenderTargets[0]);
-        this.gpuParticleSystem.copyTextureToRenderTarget(colorTexture, this.gpuParticleSystem.colorRenderTargets[0]);
-    }
-    
-    /**
-     * 初期色を計算（色更新シェーダーを実行）
-     */
-    updateInitialColors() {
-        if (!this.gpuParticleSystem) return;
-        
-        // 色更新用シェーダーにuniformを設定
-        const colorUpdateMaterial = this.gpuParticleSystem.colorUpdateMaterial;
-        if (colorUpdateMaterial && colorUpdateMaterial.uniforms) {
-            // もっとガッツリ凹ませるので、Zオフセットの範囲も拡大
-            if (!colorUpdateMaterial.uniforms.minZOffset) {
-                colorUpdateMaterial.uniforms.minZOffset = { value: -200.0 };  // ヒートマップを敏感に（-500.0 → -200.0）
-            } else {
-                colorUpdateMaterial.uniforms.minZOffset.value = -200.0;
-            }
-            if (!colorUpdateMaterial.uniforms.maxZOffset) {
-                colorUpdateMaterial.uniforms.maxZOffset = { value: 200.0 };  // ヒートマップを敏感に（500.0 → 200.0）
-            } else {
-                colorUpdateMaterial.uniforms.maxZOffset.value = 200.0;
-            }
-            
-            // 位置テクスチャを設定
-            if (this.gpuParticleSystem.positionRenderTargets && this.gpuParticleSystem.positionRenderTargets[0]) {
-                colorUpdateMaterial.uniforms.positionTexture.value = this.gpuParticleSystem.positionRenderTargets[0].texture;
-            }
-        }
-        
-        // 色更新シェーダーを実行
-        if (colorUpdateMaterial && this.gpuParticleSystem.colorRenderTargets && this.gpuParticleSystem.colorRenderTargets[0]) {
-            this.gpuParticleSystem.positionUpdateMesh.visible = false;
-            this.gpuParticleSystem.colorUpdateMesh.visible = true;
-            
-            this.renderer.setRenderTarget(this.gpuParticleSystem.colorRenderTargets[0]);
-            this.renderer.render(this.gpuParticleSystem.updateScene, this.gpuParticleSystem.updateCamera);
-            this.renderer.setRenderTarget(null);
-            
-            // 描画用シェーダーにテクスチャを設定
-            if (this.gpuParticleSystem.particleMaterial && this.gpuParticleSystem.particleMaterial.uniforms) {
-                if (this.gpuParticleSystem.particleMaterial.uniforms.colorTexture) {
-                    this.gpuParticleSystem.particleMaterial.uniforms.colorTexture.value = this.gpuParticleSystem.colorRenderTargets[0].texture;
-                }
-            }
-        }
-    }
-    
-    /**
-     * カメラパーティクルの距離パラメータを設定（Scene07と同じ画角にする）
-     */
-    setupCameraParticleDistance(cameraParticle) {
-        // Scene07と同じ設定で斜めから見下ろす角度にする
-        cameraParticle.minDistance = 4000.0;
-        cameraParticle.maxDistance = 8000.0;
-        cameraParticle.maxDistanceReset = 6000.0;
-        
-        // カメラの移動範囲を設定（Scene07と同じ）
-        const cameraBoxSize = 6000.0;
-        const cameraMinY = 1000.0;  // 斜めから見下ろすためにY座標を高めに
-        const cameraMaxY = 3000.0;
-        cameraParticle.boxMin = new THREE.Vector3(-cameraBoxSize, cameraMinY, -cameraBoxSize);
-        cameraParticle.boxMax = new THREE.Vector3(cameraBoxSize, cameraMaxY, cameraBoxSize);
-    }
-    
-    /**
-     * 簡易パーリンノイズ関数（Processingのnoise()に近い実装）
-     */
-    noise(x, y = 0, z = 0) {
-        // より良いハッシュ関数（周期的にならないように改善）
-        const hash = (ix, iy, iz) => {
-            const seed = Math.floor(this.noiseSeed);
-            // Processingのnoise()に近いハッシュ関数
-            // より大きな素数を使うことで周期性を減らす
-            // JavaScriptで安全に動作するように、ビット演算を避ける
-            let n = ix * 73856093.0;
-            n = n + iy * 19349663.0;
-            n = n + iz * 83492791.0;
-            n = n + seed * 1103515245.0;
-            // フラクショナル部分を返す（0.0-1.0の範囲）
-            // より良いハッシュ関数（周期的にならないように）
-            // 複数のsin()を組み合わせて、よりランダムな値を生成
-            const sin1 = Math.sin(n) * 43758.5453;
-            const sin2 = Math.sin(n * 0.5) * 12345.6789;
-            const sin3 = Math.sin(n * 0.25) * 98765.4321;
-            const combined = (sin1 + sin2 + sin3) % 1.0;
-            return Math.abs(combined);
-        };
-        
-        const iX = Math.floor(x);
-        const iY = Math.floor(y);
-        const iZ = Math.floor(z);
-        const fX = x - iX;
-        const fY = y - iY;
-        const fZ = z - iZ;
-        
-        const u = fX * fX * (3.0 - 2.0 * fX);
-        const v = fY * fY * (3.0 - 2.0 * fY);
-        const w = fZ * fZ * (3.0 - 2.0 * fZ);
-        
-        const a = hash(iX, iY, iZ);
-        const b = hash(iX + 1, iY, iZ);
-        const c = hash(iX, iY + 1, iZ);
-        const d = hash(iX + 1, iY + 1, iZ);
-        const e = hash(iX, iY, iZ + 1);
-        const f = hash(iX + 1, iY, iZ + 1);
-        const g = hash(iX, iY + 1, iZ + 1);
-        const h = hash(iX + 1, iY + 1, iZ + 1);
-        
-        const x1 = a + (b - a) * u;
-        const x2 = c + (d - c) * u;
-        const y1 = x1 + (x2 - x1) * v;
-        
-        const x3 = e + (f - e) * u;
-        const x4 = g + (h - g) * u;
-        const y2 = x3 + (x4 - x3) * v;
-        
-        return y1 + (y2 - y1) * w;
-    }
-    
-    /**
-     * map関数（Processingと同じ）
-     */
-    map(value, start1, stop1, start2, stop2) {
-        return start2 + (stop2 - start2) * ((value - start1) / (stop1 - start1));
-    }
-    
-    /**
-     * 更新処理
-     */
-    onUpdate(deltaTime) {
-        // 時間を更新
-        this.time += this.timeIncrement;
-        
-        // キューからsphereを追加
-        this.processPendingSpheres();
-        
-        // すべてのsphereを更新
-        this.updatePunchSpheres();
-        
-        // GPUパーティクルシステムの更新
-        if (this.gpuParticleSystem) {
-            const positionUpdateMaterial = this.gpuParticleSystem.getPositionUpdateMaterial();
-            if (positionUpdateMaterial && positionUpdateMaterial.uniforms) {
-                // Scene04専用のuniformを設定
-                if (!positionUpdateMaterial.uniforms.scl) {
-                    positionUpdateMaterial.uniforms.scl = { value: this.scl };
-                } else {
-                    positionUpdateMaterial.uniforms.scl.value = this.scl;
-                }
-                // ノイズオフセットテクスチャを設定
-                if (!positionUpdateMaterial.uniforms.noiseOffsetTexture) {
-                    positionUpdateMaterial.uniforms.noiseOffsetTexture = { value: this.noiseOffsetTexture };
-                } else {
-                    positionUpdateMaterial.uniforms.noiseOffsetTexture.value = this.noiseOffsetTexture;
-                }
-                // 地形のオフセットを設定（地形の中心を画面の中心（0, 0, 0）に合わせたので、オフセットは0）
-                if (!positionUpdateMaterial.uniforms.terrainOffset) {
-                    positionUpdateMaterial.uniforms.terrainOffset = { 
-                        value: new THREE.Vector3(0, 0, 0) 
-                    };
-                } else {
-                    positionUpdateMaterial.uniforms.terrainOffset.value.set(0, 0, 0);
-                }
-                
-                // 圧力用のuniformを設定
-                const maxSpheres = 10;
-                const activeSpheres = this.punchSpheres.filter(ps => {
-                    const strength = ps.getStrength();
-                    return strength > 0.01;
-                }).slice(0, maxSpheres);
-                
-                // デバッグ: activeSpheresの数を確認（毎回ログ出力）
-                if (this.punchSpheres.length > 0) {
-                    console.log(`onUpdate: activeSpheres.length: ${activeSpheres.length}, total punchSpheres: ${this.punchSpheres.length}`);
-                    if (activeSpheres.length > 0) {
-                        activeSpheres.forEach((ps, idx) => {
-                            console.log(`  activeSphere #${idx + 1}: strength=${ps.getStrength().toFixed(2)}, radius=${ps.getRadius().toFixed(2)}, pos=(${ps.getPosition().x.toFixed(1)}, ${ps.getPosition().y.toFixed(1)}, ${ps.getPosition().z.toFixed(1)})`);
-                        });
-                    } else {
-                        // activeSpheresが空の場合、strengthを確認
-                        console.log(`  No active spheres! Checking strengths:`);
-                        this.punchSpheres.slice(0, 5).forEach((ps, idx) => {
-                            console.log(`    punchSphere #${idx + 1}: strength=${ps.getStrength().toFixed(4)}, radius=${ps.getRadius().toFixed(2)}`);
-                        });
-                    }
-                }
-                
-                if (!positionUpdateMaterial.uniforms.punchSphereCount) {
-                    positionUpdateMaterial.uniforms.punchSphereCount = { value: 0 };
-                }
-                if (!positionUpdateMaterial.uniforms.punchSphereCenters) {
-                    // vec3の配列をFloat32Arrayで表現（x, y, z, x, y, z, ...）
-                    positionUpdateMaterial.uniforms.punchSphereCenters = { 
-                        value: new Float32Array(maxSpheres * 3)
-                    };
-                }
-                if (!positionUpdateMaterial.uniforms.punchSphereStrengths) {
-                    positionUpdateMaterial.uniforms.punchSphereStrengths = { value: new Float32Array(maxSpheres) };
-                }
-                if (!positionUpdateMaterial.uniforms.punchSphereRadii) {
-                    positionUpdateMaterial.uniforms.punchSphereRadii = { value: new Float32Array(maxSpheres) };
-                }
-                if (!positionUpdateMaterial.uniforms.punchSphereReturnProbs) {
-                    positionUpdateMaterial.uniforms.punchSphereReturnProbs = { value: new Float32Array(maxSpheres) };
-                }
-                
-                positionUpdateMaterial.uniforms.punchSphereCount.value = activeSpheres.length;
-                
-                const centers = positionUpdateMaterial.uniforms.punchSphereCenters.value;
-                const strengths = positionUpdateMaterial.uniforms.punchSphereStrengths.value;
-                const radii = positionUpdateMaterial.uniforms.punchSphereRadii.value;
-                const returnProbs = positionUpdateMaterial.uniforms.punchSphereReturnProbs.value;
-                
-                for (let i = 0; i < maxSpheres; i++) {
-                    if (i < activeSpheres.length) {
-                        const ps = activeSpheres[i];
-                        const pos = ps.getPosition();  // 位置を取得（更新された位置）
-                        // パーティクルの位置は地形のオフセット（-w/2, -h/2, 0）を考慮しているので、
-                        // sphereの位置も同じ座標系で渡す（既に地形の座標系で計算されているのでそのまま）
-                        // Float32Arrayにx, y, zを順番に格納
-                        centers[i * 3] = pos.x;
-                        centers[i * 3 + 1] = pos.y;
-                        centers[i * 3 + 2] = pos.z;
-                        strengths[i] = ps.getStrength();
-                        radii[i] = ps.getRadius();
-                        returnProbs[i] = ps.getReturnProbability();
-                        
-                        // デバッグ: 最初のsphereのみログ出力
-                        if (i === 0 && Math.random() < 0.01) {
-                            console.log(`Setting uniform for sphere #${i + 1}:`, {
-                                center: `(${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`,
-                                strength: strengths[i].toFixed(2),
-                                radius: radii[i].toFixed(2)
-                            });
-                        }
-                    } else {
-                        centers[i * 3] = 0;
-                        centers[i * 3 + 1] = 0;
-                        centers[i * 3 + 2] = 0;
-                        strengths[i] = 0;
-                        radii[i] = 0;
-                        returnProbs[i] = 0;
-                    }
-                }
-                
-                // uniformの更新を確実にする
-                if (positionUpdateMaterial.uniforms.punchSphereCenters) {
-                    positionUpdateMaterial.uniforms.punchSphereCenters.needsUpdate = true;
-                }
-                if (positionUpdateMaterial.uniforms.punchSphereStrengths) {
-                    positionUpdateMaterial.uniforms.punchSphereStrengths.needsUpdate = true;
-                }
-                if (positionUpdateMaterial.uniforms.punchSphereRadii) {
-                    positionUpdateMaterial.uniforms.punchSphereRadii.needsUpdate = true;
-                }
-                if (positionUpdateMaterial.uniforms.punchSphereReturnProbs) {
-                    positionUpdateMaterial.uniforms.punchSphereReturnProbs.needsUpdate = true;
-                }
-            }
-            
-            // 色更新用シェーダーにuniformを設定
-            const colorUpdateMaterial = this.gpuParticleSystem.colorUpdateMaterial;
-            if (colorUpdateMaterial && colorUpdateMaterial.uniforms) {
-                // もっとガッツリ凹ませるので、Zオフセットの範囲も拡大
-                if (!colorUpdateMaterial.uniforms.minZOffset) {
-                    colorUpdateMaterial.uniforms.minZOffset = { value: -500.0 };  // -120.0 → -500.0
-                } else {
-                    colorUpdateMaterial.uniforms.minZOffset.value = -500.0;
-                }
-                if (!colorUpdateMaterial.uniforms.maxZOffset) {
-                    colorUpdateMaterial.uniforms.maxZOffset = { value: 500.0 };  // 120.0 → 500.0
-                } else {
-                    colorUpdateMaterial.uniforms.maxZOffset.value = 500.0;
-                }
-            }
-            
-            // GPUParticleSystemの基本更新
-            this.gpuParticleSystem.update({
-                time: this.time,
-                noiseScale: this.noiseScale,
-                noiseStrength: this.noiseStrength,
-                baseRadius: 0
-            });
-        }
-        
-        // 線描画の更新（SHOW_LINESがtrueの場合のみ）
-        if (this.SHOW_LINES && this.lineSystem && this.gpuParticleSystem) {
-            this.updateLineSystem();
-        }
-        
-        // テキスト表示用Canvasをクリア（drawText()の前にクリアしない）
-        // テキストはdrawText()内で描画されるので、ここではクリアしない
-        // if (this.scopeCtx) {
-        //     this.scopeCtx.clearRect(0, 0, this.scopeCanvas.width, this.scopeCanvas.height);
-        // }
-    }
-    
-    /**
-     * 描画処理
-     */
-    render() {
-        // カメラを設定
-        this.setupCamera();
-        
-        // 地形の位置を設定（回転なし）
-        if (this.gpuParticleSystem) {
-            const particleSystem = this.gpuParticleSystem.getParticleSystem();
-            if (particleSystem) {
-                particleSystem.visible = this.SHOW_PARTICLES;
-                particleSystem.rotation.x = 0;  // 回転なし
-                // 地形の中心を画面の中心（0, 0, 0）に合わせたので、パーティクルシステムの位置も0
-                particleSystem.position.set(0, 0, 0);
-            }
-        }
-        
-        // テキスト表示用Canvasをクリア（すべてのテキストを描画する前にクリア）
-        if (this.scopeCtx && this.scopeCanvas) {
-            this.scopeCtx.clearRect(0, 0, this.scopeCanvas.width, this.scopeCanvas.height);
-        }
-        
-        // sphereを描画
-        this.drawPunchSpheres();
-        
-        // SceneBaseのrenderメソッドを使用（カメラデバッグも含む）
-        super.render();
-        
-        // すべてのsphereのテキストを描画（エフェクト適用後）
-        this.punchSpheres.forEach(ps => {
-            ps.drawText(this.camera);
-        });
-    }
-    
-    /**
-     * 線描画システムを作成
-     */
-    createLineSystem() {
-        if (!this.SHOW_LINES) return;
-        
-        // シェーダーを読み込む（非同期）
-        const shaderBasePath = `/shaders/scene04/`;
-        Promise.all([
-            fetch(`${shaderBasePath}lineRender.vert`).then(r => r.text()),
-            fetch(`${shaderBasePath}lineRender.frag`).then(r => r.text())
-        ]).then(([vertexShader, fragmentShader]) => {
-            this.createLineSystemWithShaders(vertexShader, fragmentShader);
-        }).catch(err => {
-            console.error('線描画シェーダーの読み込みに失敗:', err);
-        });
-    }
-    
-    /**
-     * シェーダーを使って線描画システムを作成
-     */
-    createLineSystemWithShaders(vertexShader, fragmentShader) {
-        const lineGeometries = [];
-        const lineMaterials = [];
-        
-        // 縦線：各行ごとに、左右の列を結ぶ線
-        for (let y = 0; y < this.rows - 1; y++) {
-            const vertexCount = this.cols * 2;
-            const rowIndices = new Float32Array(vertexCount);
-            const colIndices = new Float32Array(vertexCount);
-            
-            for (let x = 0; x < this.cols; x++) {
-                const index = x * 2;
-                rowIndices[index] = y;
-                colIndices[index] = x;
-                rowIndices[index + 1] = y + 1;
-                colIndices[index + 1] = x;
-            }
-            
-            const geometry = new THREE.BufferGeometry();
-            const positions = new Float32Array(vertexCount * 3);
-            const colors = new Float32Array(vertexCount * 3);
-            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-            geometry.setAttribute('rowIndex', new THREE.BufferAttribute(rowIndices, 1));
-            geometry.setAttribute('colIndex', new THREE.BufferAttribute(colIndices, 1));
-            
-            const material = new THREE.ShaderMaterial({
-                uniforms: {
-                    positionTexture: { value: null },
-                    colorTexture: { value: null },
-                    width: { value: this.cols },
-                    height: { value: this.rows }
-                },
-                vertexShader: vertexShader,
-                fragmentShader: fragmentShader,
-                transparent: true,
-                vertexColors: true,
-                linewidth: 1
-            });
-            
-            lineGeometries.push(geometry);
-            lineMaterials.push(material);
-        }
-        
-        // 横線：各列ごとに、上下の行を結ぶ線
-        for (let x = 0; x < this.cols - 1; x++) {
-            const vertexCount = this.rows * 2;
-            const rowIndices = new Float32Array(vertexCount);
-            const colIndices = new Float32Array(vertexCount);
-            
-            for (let y = 0; y < this.rows; y++) {
-                const index = y * 2;
-                rowIndices[index] = y;
-                colIndices[index] = x;
-                rowIndices[index + 1] = y;
-                colIndices[index + 1] = x + 1;
-            }
-            
-            const geometry = new THREE.BufferGeometry();
-            const positions = new Float32Array(vertexCount * 3);
-            const colors = new Float32Array(vertexCount * 3);
-            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-            geometry.setAttribute('rowIndex', new THREE.BufferAttribute(rowIndices, 1));
-            geometry.setAttribute('colIndex', new THREE.BufferAttribute(colIndices, 1));
-            
-            const material = new THREE.ShaderMaterial({
-                uniforms: {
-                    positionTexture: { value: null },
-                    colorTexture: { value: null },
-                    width: { value: this.cols },
-                    height: { value: this.rows }
-                },
-                vertexShader: vertexShader,
-                fragmentShader: fragmentShader,
-                transparent: true,
-                vertexColors: true,
-                linewidth: 1
-            });
-            
-            lineGeometries.push(geometry);
-            lineMaterials.push(material);
-        }
-        
-        // すべての線を1つのグループとして管理
-        this.lineSystem = new THREE.Group();
-        for (let i = 0; i < lineGeometries.length; i++) {
-            const line = new THREE.LineSegments(lineGeometries[i], lineMaterials[i]);
-            this.lineSystem.add(line);
-        }
-        
-        this.scene.add(this.lineSystem);
-    }
-    
-    /**
-     * 線描画システムを更新
-     */
-    updateLineSystem() {
-        if (!this.lineSystem || !this.gpuParticleSystem) return;
-        
-        const positionTexture = this.gpuParticleSystem.getPositionTexture();
-        const colorTexture = this.gpuParticleSystem.getColorTexture ? 
-            this.gpuParticleSystem.getColorTexture() : null;
-        
-        if (!positionTexture || !colorTexture) return;
-        
-        // 各線のマテリアルにテクスチャを設定
-        this.lineSystem.children.forEach(line => {
-            if (line.material && line.material.uniforms) {
-                line.material.uniforms.positionTexture.value = positionTexture;
-                line.material.uniforms.colorTexture.value = colorTexture;
-            }
-        });
-    }
-    
-    /**
-     * カメラデバッグの中心位置を取得（SceneBaseで使用）
-     */
-    getCameraDebugCenter() {
-        // 地形の中心位置を返す（地形の中心を画面の中心（0, 0, 0）に合わせた）
-        return new THREE.Vector3(0, 0, 0);
-    }
-    
-    /**
-     * カメラを設定
-     */
-    setupCamera() {
-        const eye = this.cameraParticles[this.currentCameraIndex].getPosition();
-        // 地形の中心位置（地形の中心を画面の中心（0, 0, 0）に合わせた）
-        const terrainCenter = new THREE.Vector3(0, 0, 0);
-        const up = new THREE.Vector3(0, 1, 0);
-        
-        this.camera.position.copy(eye);
-        this.camera.lookAt(terrainCenter);
-        this.camera.up.copy(up);
-    }
-    
-    /**
-     * キューからsphereを追加
-     */
-    processPendingSpheres() {
-        if (this.pendingSpheres.length > 0) {
-            console.log(`processPendingSpheres: Processing ${this.pendingSpheres.length} pending spheres`);
-            this.pendingSpheres.forEach((ps, index) => {
-                ps.createThreeObjects(this.scene, this.sphereGroup, this.scene, this.terrainRotationX);
-                ps.initScopeCanvas(this.scopeCanvas, this.scopeCtx);
-                this.punchSpheres.push(ps);
-                console.log(`  Processed sphere #${index + 1}, total punchSpheres: ${this.punchSpheres.length}`);
-            });
-            this.pendingSpheres = [];
-        }
-    }
-    
-    /**
-     * すべてのsphereを更新
-     */
-    updatePunchSpheres() {
-        // ノイズ関数とmap関数を渡して、地形のZ位置を計算
-        // 赤いSphereは永続的に残す（削除しない）
-        this.punchSpheres.forEach(ps => {
-            ps.update(
-                (x, y) => this.noise(x, y),  // ノイズ関数
-                (value, start1, stop1, start2, stop2) => this.map(value, start1, stop1, start2, stop2),  // map関数
-                this.noiseScale,  // ノイズスケール
-                this.cols,  // 列数
-                this.rows,  // 行数
-                this.scl    // スケール
-            );
-            ps.updateThreeObjects();
-            ps.drawText(this.camera);
-        });
-    }
-    
-    /**
-     * sphereを描画
-     */
-    drawPunchSpheres() {
-        // updateThreeObjects()で既に描画されているので、ここでは何もしない
-    }
-    
-    /**
-     * 力を発生させる（単純に地面のどこかにランダムで圧力を掛ける）
-     */
-    updatePunchForces(forceTrigger = false) {
-        console.log(`updatePunchForces called with forceTrigger: ${forceTrigger}`);
-        if (forceTrigger) {
-            // 地面の範囲内にランダムで発生（地形の中心を画面の中心（0, 0, 0）に合わせた）
-            // 地形の実際の範囲: (-w/2, -h/2) から (w/2, h/2)
-            const terrainMinX = -this.w / 2;
-            const terrainMaxX = this.w / 2;
-            const terrainMinY = -this.h / 2;
-            const terrainMaxY = this.h / 2;
-            
-            // punchXMin/Max, punchYMin/Maxは0.0〜1.0の範囲で指定されているので、地形の範囲に変換
-            const punchX = THREE.MathUtils.randFloat(
-                terrainMinX + (terrainMaxX - terrainMinX) * this.punchXMin,
-                terrainMinX + (terrainMaxX - terrainMinX) * this.punchXMax
-            );
-            const punchY = THREE.MathUtils.randFloat(
-                terrainMinY + (terrainMaxY - terrainMinY) * this.punchYMin,
-                terrainMinY + (terrainMaxY - terrainMinY) * this.punchYMax
-            );
-            
-            // Zは地形の高さを計算（その位置のパーティクルのZ位置を取得）
-            // 地形の中心を画面の中心（0, 0, 0）に合わせたので、グリッド座標を計算
-            const gridX = Math.floor((punchX - terrainMinX) / this.scl);
-            const gridY = Math.floor((punchY - terrainMinY) / this.scl);
-            const clampedGridX = Math.max(0, Math.min(this.cols - 1, gridX));
-            const clampedGridY = Math.max(0, Math.min(this.rows - 1, gridY));
-            
-            // その位置のノイズ値を計算してZ位置を取得
-            const noiseX = clampedGridX * this.noiseScale * 200.0;
-            const noiseY = clampedGridY * this.noiseScale * 200.0;
-            const punchZ = this.map(this.noise(noiseX, noiseY), 0, 1, -100, 100);
-            
-            const punchStrength = THREE.MathUtils.randFloat(this.punchStrengthMin, this.punchStrengthMax);
-            const punchRadius = THREE.MathUtils.randFloat(this.punchRadiusMin, this.punchRadiusMax);
-            const punchReturnProbability = Math.random();
-            
-            console.log(`Creating punch sphere at (${punchX.toFixed(1)}, ${punchY.toFixed(1)}, ${punchZ.toFixed(1)}), strength: ${punchStrength.toFixed(1)}, radius: ${punchRadius.toFixed(1)}`);
-            console.log(`  pendingSpheres.length before: ${this.pendingSpheres.length}`);
-            
-            this.createPunchSphere(punchX, punchY, punchZ, punchStrength, punchRadius, punchReturnProbability);
-            
-            console.log(`  pendingSpheres.length after: ${this.pendingSpheres.length}`);
-        } else {
-            console.log(`updatePunchForces: forceTrigger is false, skipping`);
-        }
-    }
-    
-    /**
-     * sphereを作成
-     */
-    createPunchSphere(x, y, z, strength, radius, returnProbability) {
-        const punchCenter = new THREE.Vector3(x, y, z);
-        const sphere = new Scene04_PunchSphere(punchCenter, strength, radius, returnProbability);
-        this.pendingSpheres.push(sphere);
-        console.log(`createPunchSphere: Added sphere to pendingSpheres, total: ${this.pendingSpheres.length}`);
-    }
-    
-    /**
-     * OSCメッセージの処理
-     */
-    handleTrackNumber(trackNumber, message) {
-        // トラック1: カメラをランダムに切り替える
-        if (trackNumber === 1) {
-            this.switchCameraRandom();
-        }
-        // トラック2: 背景を白にする（親クラスで処理）
-        // トラック5: 力の発生
-        else if (trackNumber === 5) {
-            this.updatePunchForces(true);
-        }
-    }
-    
-    /**
-     * キーダウン処理
-     */
-    handleKeyDown(trackNumber) {
-        super.handleKeyDown(trackNumber);
-        
-        // トラック5: 力の発生（handleTrackNumberでも呼ばれるので、ここでは何もしない）
-        // if (trackNumber === 5) {
-        //     this.updatePunchForces(true);
-        // }
-    }
-    
-    
-    // switchCameraRandom()は基底クラスの実装を使用（8個全部のカメラをランダマイズ）
-    
-    /**
-     * リセット処理
-     */
-    reset() {
-        super.reset(); // TIMEをリセット
-        // 初期パーティクルデータを再設定
-        this.initializeParticleData();
-        
-        // すべてのカメラパーティクルをリセット
-        this.cameraParticles.forEach(cp => cp.reset());
+        // さらに補助ライト（反対側から照らして影を減らす）
+        const directionalLight3 = new THREE.DirectionalLight(0xffffff, 0.5);
+        directionalLight3.position.set(-200, 100, -200);
+        directionalLight3.castShadow = false;
+        directionalLight3.target.position.set(0, 0, 0);
+        this.scene.add(directionalLight3.target);
+        this.scene.add(directionalLight3);
+
+        // カメラパーティクルを初期化（Track1用）
+        const { CameraParticle } = await import('../../lib/CameraParticle.js');
+        this.cameraParticles = [];
         this.currentCameraIndex = 0;
+        this.cameraCenter = new THREE.Vector3(0, 0, 0);
         
-        // すべてのsphereをクリア
-        this.punchSpheres.forEach(ps => ps.dispose(this.scene, this.sphereGroup));
-        this.punchSpheres = [];
-        this.pendingSpheres = [];
+        // Terrainの上を動き回るカメラパーティクルを設定
+        // カメラをもっと遠くまで動かせるように範囲を大幅に拡大
+        // ただし、Terrainの範囲内に収まるように調整（Terrainは-1000～1000の範囲）
+        const terrainHalfSize = 1000; // Terrainの半分のサイズ
+        // カメラを高くする（Y方向の範囲を上げる）
+        const boxMin = new THREE.Vector3(-terrainHalfSize * 0.8, 80, -terrainHalfSize * 0.8);  // 20 -> 80
+        const boxMax = new THREE.Vector3(terrainHalfSize * 0.8, 250, terrainHalfSize * 0.8);  // 150 -> 250
         
-        // グループをクリア（既存のCircleも削除）
-        if (this.sphereGroup) {
-            // 既存のオブジェクトをすべて削除
-            while (this.sphereGroup.children.length > 0) {
-                const child = this.sphereGroup.children[0];
-                this.sphereGroup.remove(child);
-                if (child.geometry) child.geometry.dispose();
-                if (child.material) child.material.dispose();
-            }
+        // 8台のカメラを初期化
+        for (let i = 0; i < 8; i++) {
+            const cp = new CameraParticle();
+            // Scene04はTerrainが大きいので、少し強めに設定
+            cp.maxSpeed = 0.15;  // Scene01より少し大きめ
+            cp.maxForce = 0.05;  // Scene01より少し大きめ（forceMulを掛けても0.0025～0.0075になる）
+            cp.friction = 0.005;  // 摩擦を弱くする（0.02 -> 0.005）
+            
+            // Boxの境界を設定
+            cp.boxMin = boxMin.clone();
+            cp.boxMax = boxMax.clone();
+            
+            // 初期位置をBox内にランダムに配置（Terrainの範囲内に収まるように）
+            cp.position.set(
+                boxMin.x + Math.random() * (boxMax.x - boxMin.x),
+                boxMin.y + Math.random() * (boxMax.y - boxMin.y),
+                boxMin.z + Math.random() * (boxMax.z - boxMin.z)
+            );
+            
+            this.cameraParticles.push(cp);
         }
         
-        // シーンから直接Circleを削除（念のため）
-        if (this.scene) {
-            const objectsToRemove = [];
-            this.scene.traverse((object) => {
-                if (object.userData && object.userData.isPunchSphereCircle) {
-                    objectsToRemove.push(object);
+        // 初期カメラ位置も設定（Terrainの範囲内に収まるように、高く設定）
+        const initialCamPos = new THREE.Vector3(0, 120, 100);  // 50 -> 120（高く）
+        this.camera.position.copy(initialCamPos);
+        this.camera.lookAt(this.cameraCenter);
+        this.camera.updateMatrixWorld();
+        
+        // Terrain作成（TSL頂点シェーダー方式）
+        this._createTerrain();
+        
+        // カメラパーティクルの可視化（c/C）を共通化：SceneBase側で描画
+        // NOTE: overlaySceneが確実に初期化された後に呼ぶ
+        this.initCameraDebug(this.overlayScene);
+        
+        // 3Dグリッド＋ルーラー（床＋垂直面＋目盛り）
+        // Scene01と同じ計算式を使用
+        const terrainSize = 2000;
+        const terrainHeight = 20; // 高さ方向の範囲
+        const floorY = -0.02; // TerrainのgroundYと同じ
+        // Scene01と同じ計算式：床グリッドの大きさ（箱の外側に少し余白があるくらいにする）
+        const floorSize = Math.max(terrainSize, terrainSize) * 2.2; // 2000 * 2.2 = 4400
+        this.worldGrid = new GridRuler3D();
+        this.worldGrid.init({
+            center: { x: 0, y: 0, z: 0 },
+            size: { x: terrainSize, y: terrainHeight, z: terrainSize },
+            floorSize: floorSize, // Scene01と同じ計算式
+            floorY: floorY,
+            color: 0xffffff,
+            opacity: 0.25 // Scene01と同じ（控えめに）
+        });
+        this.worldGrid.setVisible(this.SHOW_WORLD_GRID);
+        this.scene.add(this.worldGrid.group);
+        
+        // カメラ設定を変更した後、PostFXを再初期化（カメラが変更されているため）
+        if (this.postProcessing) {
+            try {
+                this.postProcessing.dispose();
+            } catch (e) {
+                // エラーを無視
+            }
+            this.postProcessing = null;
+        }
+        // 明示的にシーン、オーバーレイシーン、カメラを渡して初期化
+        this.initPostFX({
+            scene: this.scene,
+            overlayScene: this.overlayScene,
+            camera: this.camera
+        });
+        
+        // デバッグ: シーンの状態を確認
+        console.log('Scene04 setup complete:', {
+            sceneChildren: this.scene.children.length,
+            terrainMesh: this.terrainMesh ? 'exists' : 'missing',
+            cameraPos: this.camera.position.clone(),
+            cameraLookAt: new THREE.Vector3(0, 0, 0),
+            cameraParticles: this.cameraParticles.length,
+            postProcessing: this.postProcessing ? 'exists' : 'missing',
+            scene: this.scene ? 'exists' : 'missing',
+            overlayScene: this.overlayScene ? 'exists' : 'missing'
+        });
+    }
+
+    _createTerrain() {
+        // シンプルな大きなPlaneを作成（CPU頂点計算方式）
+        // NOTE: TSL/positionNodeを使うと他シーンに影響するため、CPU側で計算
+        const terrainWidth = 2000;
+        const terrainDepth = 2000;
+        const terrainSegments = 500; // CPUで計算するので少し減らす
+
+        const terrainGeom = new THREE.PlaneGeometry(terrainWidth, terrainDepth, terrainSegments, terrainSegments);
+        terrainGeom.rotateX(-Math.PI / 2);
+
+        // CPU側で頂点位置を計算
+        const positions = terrainGeom.attributes.position;
+        const vertexCount = positions.count;
+        const groundY = -0.02;
+
+        for (let i = 0; i < vertexCount; i++) {
+            const x = positions.getX(i);
+            const z = positions.getZ(i);
+
+            // エリアマスク
+            let highLowMask = (Math.sin(x * 0.0008) * Math.cos(z * 0.0007) + 1.0) * 0.5;
+            highLowMask *= (Math.sin(x * 0.0009 + z * 0.0008) * Math.cos(z * 0.00085 - x * 0.00075) + 1.0) * 0.5;
+            highLowMask *= (Math.sin(z * 0.00075) * Math.cos(x * 0.00085) + 1.0) * 0.5;
+            highLowMask *= (Math.sin(x * 0.0012 + z * 0.001) * Math.cos(z * 0.0011 - x * 0.0009) + 1.0) * 0.5;
+
+            // エリアタイプ
+            let areaType;
+            if (highLowMask < 0.25) {
+                areaType = Math.pow(highLowMask / 0.25, 3.0) * 0.1;
+            } else if (highLowMask < 0.75) {
+                areaType = Math.pow((highLowMask - 0.25) / 0.5, 3.0) * 0.8 + 0.1;
+            } else {
+                areaType = Math.pow((highLowMask - 0.75) / 0.25, 3.0) * 0.1 + 0.9;
+            }
+
+            // ノイズ
+            const ridge1 = Math.sin(x * 0.01) * Math.cos(z * 0.01) * 15.0;
+            const ridge2 = Math.sin(x * 0.015 + z * 0.012) * Math.cos(z * 0.014 - x * 0.011) * 13.0;
+            const ridge3 = Math.sin(x * 0.012 - z * 0.013) * Math.cos(z * 0.015 + x * 0.010) * 12.0;
+            const ridge4 = Math.sin(z * 0.01) * Math.cos(x * 0.01) * 14.0;
+            const largeNoise = ridge1 + ridge2 + ridge3 + ridge4;
+
+            const medium1 = Math.sin(x * 0.05) * Math.cos(z * 0.05) * 8.0;
+            const medium2 = Math.sin(x * 0.06 + z * 0.04) * Math.cos(z * 0.05 - x * 0.04) * 7.0;
+            const medium3 = Math.sin(x * 0.04 - z * 0.06) * Math.cos(z * 0.05 + x * 0.05) * 6.0;
+            const medium4 = Math.sin(z * 0.05) * Math.cos(x * 0.05) * 7.5;
+            const mediumNoise = medium1 + medium2 + medium3 + medium4;
+
+            const fine1 = Math.sin(x * 0.15) * Math.cos(z * 0.12) * 2.5;
+            const fine2 = Math.sin(x * 0.18 + z * 0.15) * Math.cos(z * 0.16 - x * 0.14) * 2.0;
+            const fine3 = Math.sin(x * 0.14 - z * 0.18) * Math.cos(z * 0.15 + x * 0.17) * 1.8;
+            const fineNoise = fine1 + fine2 + fine3;
+
+            const firstPass = largeNoise + mediumNoise * 0.5;
+            const fineNoiseNormalized = (fineNoise + 6.3) / 12.6;
+            const secondPass = firstPass * (fineNoiseNormalized * 0.8 + 0.6);
+
+            const extra1 = Math.sin(x * 0.03 + z * 0.025) * Math.cos(z * 0.028 - x * 0.022) * 10.0;
+            const extra2 = Math.sin(x * 0.025 - z * 0.03) * Math.cos(z * 0.022 + x * 0.028) * 9.0;
+            const extra3 = Math.sin(z * 0.03) * Math.cos(x * 0.025) * 8.5;
+            const combinedNoise = secondPass + (extra1 + extra2 + extra3) * 0.4;
+
+            const baseHeight = areaType * 400.0 - 150.0;
+            const areaNoiseScale = areaType * 1.3 + 0.2;
+            const areaNoise = combinedNoise * areaNoiseScale;
+            let noise = baseHeight + areaNoise;
+
+            // エリアタイプで強調
+            if (areaType < 0.2) {
+                noise = noise * 0.8 - 30.0;
+            } else if (areaType >= 0.8) {
+                noise = noise * 1.2 + 50.0;
+            }
+
+            positions.setY(i, groundY + noise);
+        }
+
+        positions.needsUpdate = true;
+        terrainGeom.computeVertexNormals();
+
+        // 普通のMeshStandardMaterial（TSLを使わない）
+        const terrainMat = new THREE.MeshStandardMaterial({
+            color: 0x2a2a2a,
+            roughness: 0.3,
+            metalness: 0.8,
+            side: THREE.DoubleSide,
+        });
+
+        this.terrainMesh = new THREE.Mesh(terrainGeom, terrainMat);
+        this.terrainMesh.position.set(0, 0, 0);
+        this.terrainMesh.receiveShadow = false;
+        this.terrainMesh.castShadow = false;
+        this.terrainMesh.frustumCulled = false;
+        this.scene.add(this.terrainMesh);
+
+        console.log('Terrain created (CPU vertex calculation)');
+    }
+
+    onUpdate(deltaTime) {
+        super.onUpdate(deltaTime);
+        
+        // グリッドの更新（カメラに追従）
+        if (this.worldGrid) {
+            this.worldGrid.setVisible(this.SHOW_WORLD_GRID);
+            this.worldGrid.update(this.camera);
+        }
+        
+        // カメラパーティクルの更新（Track1用）
+        const camMoveOn = !!this.trackEffects[1];
+        if (this.cameraParticles && this.cameraParticles.length > 0) {
+            this.cameraParticles.forEach((cp) => {
+                cp.enableMovement = camMoveOn;
+                cp.update(deltaTime);
+                
+                // トラック1がOFFの時は、力もリセット（新しいランダマイズを止める）
+                if (!camMoveOn) {
+                    cp.force.set(0, 0, 0);
                 }
             });
-            objectsToRemove.forEach(obj => {
-                this.scene.remove(obj);
-                if (obj.geometry) obj.geometry.dispose();
-                if (obj.material) obj.material.dispose();
-            });
+            
+            const cp = this.cameraParticles[this.currentCameraIndex];
+            if (cp) {
+                // カメラ位置を更新
+                const camPos = cp.getPosition();
+                this.camera.position.copy(camPos);
+                
+                // カメラの向きを更新（Terrainの中心を見る）
+                this.camera.lookAt(this.cameraCenter);
+                this.camera.updateMatrixWorld();
+                
+                // デバッグ: カメラ位置が範囲外に出ていないか確認
+                if (this.SHOW_CAMERA_DEBUG) {
+                    const distToCenter = camPos.length();
+                    const maxDist = Math.sqrt(2000 * 2000 + 200 * 200 + 2000 * 2000); // 最大距離
+                    if (distToCenter > maxDist * 1.1) {
+                        console.warn('Scene04: カメラが範囲外:', {
+                            position: camPos.clone(),
+                            distance: distToCenter,
+                            maxDistance: maxDist
+                        });
+                    }
+                }
+            }
         }
-        
-        // テキスト表示用Canvasをクリア
-        if (this.scopeCtx && this.scopeCanvas) {
-            this.scopeCtx.clearRect(0, 0, this.scopeCanvas.width, this.scopeCanvas.height);
-        }
-        
-        console.log('Scene04 reset');
     }
     
-    /**
-     * リサイズ処理
-     */
+    switchCameraRandom(force = false) {
+        // force=trueの場合はtrackEffects[1]をチェックしない（フェーズ変更時など）
+        if (!force && !this.trackEffects[1]) return;
+        
+        if (!this.cameraParticles || this.cameraParticles.length < 2) return;
+        let newIndex = this.currentCameraIndex;
+        while (newIndex === this.currentCameraIndex) {
+            newIndex = Math.floor(Math.random() * this.cameraParticles.length);
+        }
+        this.currentCameraIndex = newIndex;
+    }
+    
+    applyTrack1Camera(velocity, durationMs) {
+        // Track1: カメラ用CameraParticleに「力ランダム（弱め）+ カメラ切替」
+        // - velocity でブースト量を決める（Scene01と同じロジック）
+        // - 力を弱めに調整
+        if (!this.trackEffects?.[1]) {
+            console.warn('Scene04.applyTrack1Camera: trackEffects[1] is false');
+            return;
+        }
+        const cps = this.cameraParticles;
+        if (!cps || cps.length === 0) {
+            console.warn('Scene04.applyTrack1Camera: cameraParticles is empty');
+            return;
+        }
+
+        const v01 = Math.min(Math.max((Number(velocity) || 0) / 127, 0), 1);
+        // Scene01と同じパラメータ
+        // NOTE: forceMulはmaxForceに掛けるので、小さな値になる
+        // Scene04はTerrainが大きいので、少し強めに設定
+        // でも、applyRandomForceWeak()のstrengthが0.2～1.0なので、maxForceもそれに合わせる必要がある
+        const forceMul = 1.0 + 0.5 * v01;  // 1.0～1.5（maxForceを増やす）
+        const speedMul = 1.00 + 0.02 * v01;
+        const now = Date.now();
+        const holdMs = Math.max(0, Number(durationMs) || 0) > 0 ? Number(durationMs) : 80;
+
+        cps.forEach((cp, index) => {
+            if (!cp) return;
+            // baseを初回だけ記録
+            if (typeof cp.__track1BaseMaxForce === 'undefined') cp.__track1BaseMaxForce = cp.maxForce;
+            if (typeof cp.__track1BaseMaxSpeed === 'undefined') cp.__track1BaseMaxSpeed = cp.maxSpeed;
+
+            // ブーストを設定（期限切れは updateTrack1CameraBoosts() が戻す）
+            cp.__track1BoostUntilMs = now + holdMs;
+            const oldMaxForce = cp.maxForce;
+            const oldMaxSpeed = cp.maxSpeed;
+            // maxForceを増やして、applyRandomForceWeak()の力がクランプされないようにする
+            cp.maxForce = (Number(cp.__track1BaseMaxForce) || cp.maxForce) * forceMul;
+            cp.maxSpeed = (Number(cp.__track1BaseMaxSpeed) || cp.maxSpeed) * speedMul;
+
+            // 力をランダム化（方向/回転）
+            // NOTE: 強すぎる場合があるので "Weak" を優先
+            const oldForce = cp.force.clone();
+            if (typeof cp.applyRandomForceWeak === 'function') {
+                cp.applyRandomForceWeak();
+            } else if (typeof cp.applyRandomForce === 'function') {
+                cp.applyRandomForce();
+            } else {
+                console.warn(`Scene04.applyTrack1Camera: cp[${index}] has no applyRandomForceWeak or applyRandomForce`);
+            }
+            
+            // デバッグ: 最初のパーティクルだけログ出力
+            if (index === 0) {
+                console.log('Scene04.applyTrack1Camera:', {
+                    velocity,
+                    v01,
+                    forceMul,
+                    speedMul,
+                    oldMaxForce,
+                    newMaxForce: cp.maxForce,
+                    oldMaxSpeed,
+                    newMaxSpeed: cp.maxSpeed,
+                    oldForce: oldForce,
+                    newForce: cp.force.clone(),
+                    hasApplyRandomForceWeak: typeof cp.applyRandomForceWeak === 'function',
+                    hasApplyRandomForce: typeof cp.applyRandomForce === 'function'
+                });
+            }
+        });
+
+        // カメラを切り替える
+        this.switchCameraRandom();
+    }
+
+    // render()をオーバーライド
+    async render() {
+        if (!this.postProcessing) {
+            console.warn('Scene04: postProcessing is null');
+            return;
+        }
+
+        try {
+            await super.render();
+        } catch (err) {
+            console.error('Scene04 renderエラー:', err);
+        }
+    }
+
+    handleKeyPress(key) {
+        // 共通キーはSceneBaseで処理（c/Cなど）
+        if (super.handleKeyPress && super.handleKeyPress(key)) return;
+        if (key === 'g' || key === 'G') {
+            // g/Gは3Dグリッド（遮蔽が効く方）をトグル
+            this.SHOW_WORLD_GRID = !this.SHOW_WORLD_GRID;
+            if (this.worldGrid) {
+                this.worldGrid.setVisible(this.SHOW_WORLD_GRID);
+            }
+        }
+    }
+
+    handleTrackNumber(trackNumber, message) {
+        const args = message?.args || [];
+        const velocity = Number(args[1] ?? 127);
+        const durationMs = Number(args[2] ?? 0);
+        
+        if (trackNumber === 1) {
+            this.applyTrack1Camera(velocity, durationMs);
+            return;
+        }
+        
+        // track2-4は親クラスで処理
+        super.handleTrackNumber(trackNumber, message);
+    }
+
     onResize() {
         super.onResize();
-        
-        if (this.scopeCanvas) {
-            this.scopeCanvas.width = window.innerWidth;
-            this.scopeCanvas.height = window.innerHeight;
+        if (this.camera) {
+            this.camera.aspect = window.innerWidth / window.innerHeight;
+            this.camera.updateProjectionMatrix();
         }
     }
-    
-    /**
-     * クリーンアップ処理（シーン切り替え時に呼ばれる）
-     */
+
     dispose() {
-        console.log('Scene04.dispose: クリーンアップ開始');
-        
-        // GPUパーティクルシステムを破棄
-        if (this.gpuParticleSystem) {
-            const particleSystem = this.gpuParticleSystem.getParticleSystem();
-            if (particleSystem) {
-                this.scene.remove(particleSystem);
+        // terrainMeshを破棄
+        if (this.terrainMesh) {
+            try {
+                this.scene.remove(this.terrainMesh);
+                if (this.terrainMesh.geometry) this.terrainMesh.geometry.dispose();
+                if (this.terrainMesh.material) this.terrainMesh.material.dispose();
+            } catch (e) {
+                // WebGPU のノード管理エラーを無視
             }
-            this.gpuParticleSystem.dispose();
-            this.gpuParticleSystem = null;
+            this.terrainMesh = null;
         }
         
-        // 線描画システムを破棄
-        if (this.lineSystem) {
-            this.lineSystem.children.forEach(line => {
-                if (line.geometry) line.geometry.dispose();
-                if (line.material) line.material.dispose();
-            });
-            this.scene.remove(this.lineSystem);
-            this.lineSystem = null;
+        // グリッドを破棄
+        if (this.worldGrid) {
+            try {
+                if (this.worldGrid.group && this.worldGrid.group.parent) {
+                    this.worldGrid.group.parent.remove(this.worldGrid.group);
+                }
+                this.worldGrid.dispose();
+            } catch (e) {
+                // エラーを無視
+            }
+            this.worldGrid = null;
         }
         
-        // すべてのsphereを破棄
-        this.punchSpheres.forEach(ps => {
-            if (ps.dispose) {
-                ps.dispose(this.scene, this.sphereGroup);
-            }
-        });
-        this.punchSpheres = [];
-        this.pendingSpheres = [];
-        
-        // グループをクリア
-        if (this.sphereGroup) {
-            while (this.sphereGroup.children.length > 0) {
-                const child = this.sphereGroup.children[0];
-                this.sphereGroup.remove(child);
-                if (child.geometry) child.geometry.dispose();
-                if (child.material) child.material.dispose();
-            }
-            this.scene.remove(this.sphereGroup);
-            this.sphereGroup = null;
-        }
-        
-        // テキスト表示用Canvasを削除
-        if (this.scopeCanvas && this.scopeCanvas.parentElement) {
-            this.scopeCanvas.parentElement.removeChild(this.scopeCanvas);
-            this.scopeCanvas = null;
-            this.scopeCtx = null;
-        }
-        
-        // ノイズオフセットテクスチャを破棄
-        if (this.noiseOffsetTexture) {
-            this.noiseOffsetTexture.dispose();
-            this.noiseOffsetTexture = null;
-        }
-        
-        // すべてのライトを削除
-        const lightsToRemove = [];
-        this.scene.traverse((object) => {
-            if (object instanceof THREE.Light) {
-                lightsToRemove.push(object);
-            }
-        });
-        lightsToRemove.forEach(light => {
-            this.scene.remove(light);
-            if (light.dispose) {
-                light.dispose();
-            }
-        });
-        
-        console.log('Scene04.dispose: クリーンアップ完了');
-        
-        // 親クラスのdisposeを呼ぶ
         super.dispose();
+    }
+    
+    initCameraDebugObjects() {
+        if (!this.cameraDebugGroup) {
+            console.warn('Scene04.initCameraDebugObjects: cameraDebugGroup is null');
+            return;
+        }
+        if (!this.cameraParticles || this.cameraParticles.length === 0) {
+            console.warn('Scene04.initCameraDebugObjects: cameraParticles is empty');
+            return;
+        }
+        
+        const sphereSize = 0.03;
+        const circleRadius = 0.08;
+        const circleSegments = 32;
+        
+        // 既存をクリア
+        this.cameraDebugGroup.clear();
+        this.cameraDebugSpheres = [];
+        this.cameraDebugLines = [];
+        this.cameraDebugCircles = [];
+        this.cameraDebugTextPositions = [];
+        
+        for (let i = 0; i < this.cameraParticles.length; i++) {
+            const sphereGeometry = new THREE.SphereGeometry(sphereSize, 32, 32);
+            // Scene04は大きなTerrainなので、MeshBasicMaterialでライト不要にする
+            const sphereMaterial = new THREE.MeshBasicMaterial({
+                color: 0xff0000,
+                transparent: false,
+                opacity: 1.0
+            });
+            const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+            sphere.visible = false;
+            this.cameraDebugGroup.add(sphere);
+            this.cameraDebugSpheres.push(sphere);
+            
+            const ringGeom = new THREE.RingGeometry(circleRadius * 0.94, circleRadius, circleSegments);
+            const ringMat = new THREE.MeshBasicMaterial({
+                color: 0xff0000,
+                transparent: true,
+                opacity: 1.0,
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+            const circleXY = new THREE.Mesh(ringGeom, ringMat);
+            circleXY.rotation.x = -Math.PI / 2;
+            circleXY.visible = false;
+            circleXY.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleXY);
+            
+            const circleXZ = new THREE.Mesh(ringGeom.clone(), ringMat.clone());
+            circleXZ.visible = false;
+            circleXZ.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleXZ);
+            
+            const circleYZ = new THREE.Mesh(ringGeom.clone(), ringMat.clone());
+            circleYZ.rotation.y = Math.PI / 2;
+            circleYZ.visible = false;
+            circleYZ.renderOrder = 1000;
+            this.cameraDebugGroup.add(circleYZ);
+            
+            this.cameraDebugCircles.push([circleXY, circleXZ, circleYZ]);
+            
+            const lineGeometry = new THREE.BufferGeometry();
+            const linePositions = new Float32Array(6);
+            const linePosAttr = new THREE.BufferAttribute(linePositions, 3);
+            lineGeometry.setAttribute('position', linePosAttr);
+            const lineMaterial = new THREE.LineBasicMaterial({
+                color: 0xff0000,
+                transparent: false,
+                opacity: 1.0
+            });
+            const line = new THREE.Line(lineGeometry, lineMaterial);
+            line.visible = false;
+            line.userData.positionAttr = linePosAttr;
+            this.cameraDebugGroup.add(line);
+            this.cameraDebugLines.push(line);
+        }
+        
+        // overlaySceneに確実に追加されているか確認し、必要なら移動
+        if (this.cameraDebugGroup && this.overlayScene && this.cameraDebugGroup.parent !== this.overlayScene) {
+            try {
+                if (this.cameraDebugGroup.parent) {
+                    this.cameraDebugGroup.parent.remove(this.cameraDebugGroup);
+                }
+                this.overlayScene.add(this.cameraDebugGroup);
+            } catch (e) {
+                console.warn('Scene04.initCameraDebugObjects: failed to move to overlayScene', e);
+            }
+        }
+        
+        console.log('Scene04.initCameraDebugObjects: created', {
+            spheres: this.cameraDebugSpheres.length,
+            lines: this.cameraDebugLines.length,
+            circles: this.cameraDebugCircles.length,
+            cameraParticles: this.cameraParticles.length,
+            groupParent: this.cameraDebugGroup.parent?.constructor?.name || 'null',
+            overlayScene: this.overlayScene ? 'exists' : 'missing',
+            scene: this.scene ? 'exists' : 'missing'
+        });
     }
 }

@@ -22,10 +22,9 @@ export class LFO {
             deltaTime = 1/60;
         }
         
-        // Processingと同じ計算式：phase += TWO_PI * rate / 60.0
-        // Processingは60fps固定で計算しているため、deltaTimeに関係なく60fps基準で計算
-        // これにより、フレームレートが変わっても同じ速度で揺らす
-        this.phase += Math.PI * 2 * this.rate / 60.0;
+        // 周波数rateは「1秒あたりの周期数」なので、実時間deltaTimeに比例して位相を進める。
+        // これによりFPSが上下しても“現実時間の揺れ速度”が一定になる。
+        this.phase += Math.PI * 2 * this.rate * deltaTime;
         
         // 位相を0〜2πの範囲に制限
         while (this.phase >= Math.PI * 2) {

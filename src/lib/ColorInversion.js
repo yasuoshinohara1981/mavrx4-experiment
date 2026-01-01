@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { debugLog } from './DebugLogger.js';
 
 export class ColorInversion {
     constructor(renderer, scene, camera) {
@@ -27,11 +28,11 @@ export class ColorInversion {
      * 初期化
      */
     async init() {
-        console.log('ColorInversion: 初期化開始');
+        debugLog('colorInversion', '初期化開始');
         // シェーダーを読み込む
         const shaderBasePath = `/shaders/common/`;
         try {
-            console.log(`ColorInversion: シェーダー読み込み開始 - ${shaderBasePath}colorInversion.vert`);
+            debugLog('colorInversion', `シェーダー読み込み開始 - ${shaderBasePath}colorInversion.vert`);
             const [vertexShader, fragmentShader] = await Promise.all([
                 fetch(`${shaderBasePath}colorInversion.vert`).then(r => {
                     if (!r.ok) throw new Error(`Failed to load vertex shader: ${r.status}`);
@@ -47,7 +48,7 @@ export class ColorInversion {
                 throw new Error('Shader files are empty');
             }
             
-            console.log('ColorInversion: シェーダー読み込み完了');
+            debugLog('colorInversion', 'シェーダー読み込み完了');
             
             // EffectComposerを作成
             this.composer = new EffectComposer(this.renderer);
@@ -73,7 +74,7 @@ export class ColorInversion {
             
             // 初期化完了
             this.initialized = true;
-            console.log('ColorInversion initialized successfully');
+            debugLog('colorInversion', '初期化完了');
         } catch (err) {
             console.error('色反転シェーダーの読み込みに失敗:', err);
             // エラーでも初期化フラグを立てる（後で再試行できるように）
@@ -88,7 +89,12 @@ export class ColorInversion {
         this.enabled = enabled;
         if (this.inversionPass) {
             this.inversionPass.enabled = enabled;
-            console.log(`ColorInversion setEnabled: ${enabled}, inversionPass.enabled: ${this.inversionPass.enabled}`);
+            // スタックトレースを出力して、どこから呼ばれたか特定
+            if (!enabled) {
+                debugLog('colorInversion', `setEnabled: ${enabled}, 呼び出し元:`, new Error().stack.split('\n').slice(1, 4).join('\n'));
+            } else {
+                debugLog('colorInversion', `setEnabled: ${enabled}`);
+            }
         } else {
             console.warn('ColorInversion: inversionPass is null');
         }
@@ -98,15 +104,19 @@ export class ColorInversion {
      * 色反転エフェクトを適用（デュレーション付き）
      */
     apply(velocity, durationMs) {
+        debugLog('colorInversion', `apply() - velocity:${velocity}, durationMs:${durationMs}`);
+        
         // エフェクトを有効化
         this.setEnabled(true);
         
         // デュレーション（サスティン）を設定
         if (durationMs > 0) {
             this.endTime = Date.now() + durationMs;
+            debugLog('colorInversion', `endTime設定: ${this.endTime} (現在時刻 + ${durationMs}ms)`);
         } else {
             // デュレーションが0の場合は無期限（キーが離されるまで）
             this.endTime = 0;
+            debugLog('colorInversion', 'endTime=0 (無期限モード)');
         }
     }
     
