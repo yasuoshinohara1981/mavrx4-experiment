@@ -71,7 +71,7 @@ export class Scene03 extends SceneBase {
         this.lookAtTarget = new THREE.Vector3(0, 1, 0);
         this.lookAtGoal = new THREE.Vector3(0, 1, 0);
         this.lastLookAtChangeTime = 0;
-        this.lookAtMinInterval = 1000;
+        this.lookAtMinInterval = 1000; // 1秒間隔（最速）
         
         // カメラパーティクル
         this.cameraParticle = null;
@@ -131,6 +131,14 @@ export class Scene03 extends SceneBase {
         // カメラパーティクルの初期化
         this.cameraParticle = new CameraParticle();
         this.cameraParticle.position.set(0, 3, 0);
+        // 立方体の境界を設定（カメラが遠くに行きすぎないように）
+        this.cameraParticle.boxMin = new THREE.Vector3(-15, 0, -1000);
+        this.cameraParticle.boxMax = new THREE.Vector3(15, 30, 1000);
+        // 速度制限を低くして制御しやすく、摩擦を強めに
+        this.cameraParticle.maxSpeed = 2.0;
+        this.cameraParticle.maxForce = 0.8;
+        this.cameraParticle.friction = 0.25; // 摩擦を強めに（跳ね返りを抑える）
+        this.cameraParticle.bounceDamping = 0.3; // 跳ね返りを大幅に減衰
         
         // ジオメトリとマテリアルを作成
         this._createGeometriesAndMaterials();
@@ -338,40 +346,51 @@ export class Scene03 extends SceneBase {
             linewidth: 1,
         });
         
-        // === Track8,9,10: 薄い金属片 ===
-        // Track8: シルバー
-        this.geometries.track8 = new THREE.BoxGeometry(2.0, 2.0, 0.05);
+        // === Track8,9,10: シリンダーを「剥がした」ような薄い曲面金属片（それぞれ異なる形） ===
+        // 高さがあって薄い、シリンダーの一部を剥がしたような形
+        
+        // Track8: シルバー - シリンダーの90度部分を剥がした形（高さあり、小さめ）
+        this.geometries.track8 = new THREE.CylinderGeometry(
+            0.8, 0.8, 1.5, 32, 1, true, 0, Math.PI / 2 // 半径0.8, 高さ1.5, 90度
+        );
         this.materials.track8 = new THREE.MeshPhysicalMaterial({
             color: 0xc0c0c0, // シルバー
             roughness: 0.05,
             metalness: 1.0,
             clearcoat: 1.0,
+            side: THREE.DoubleSide,
         });
         this.materials.track8Edge = new THREE.LineBasicMaterial({
             color: 0x0a0a0a,
             linewidth: 1,
         });
         
-        // Track9: 黒
-        this.geometries.track9 = new THREE.BoxGeometry(2.0, 2.0, 0.05);
+        // Track9: 黒 - シリンダーの120度部分を剥がした形（高さあり、小さめ）
+        this.geometries.track9 = new THREE.CylinderGeometry(
+            0.6, 0.6, 1.8, 32, 1, true, 0, Math.PI * 2 / 3 // 半径0.6, 高さ1.8, 120度
+        );
         this.materials.track9 = new THREE.MeshPhysicalMaterial({
             color: 0x0a0a0a, // 黒
             roughness: 0.15,
             metalness: 1.0,
             clearcoat: 0.8,
+            side: THREE.DoubleSide,
         });
         this.materials.track9Edge = new THREE.LineBasicMaterial({
             color: 0x0a0a0a,
             linewidth: 1,
         });
         
-        // Track10: グレー
-        this.geometries.track10 = new THREE.BoxGeometry(2.0, 2.0, 0.05);
+        // Track10: グレー - シリンダーの180度部分を剥がした形（高さあり、小さめ）
+        this.geometries.track10 = new THREE.CylinderGeometry(
+            1.0, 1.0, 1.2, 32, 1, true, 0, Math.PI // 半径1.0, 高さ1.2, 180度
+        );
         this.materials.track10 = new THREE.MeshPhysicalMaterial({
             color: 0x606060, // グレー
             roughness: 0.1,
             metalness: 1.0,
             clearcoat: 0.9,
+            side: THREE.DoubleSide,
         });
         this.materials.track10Edge = new THREE.LineBasicMaterial({
             color: 0x0a0a0a,
@@ -868,7 +887,7 @@ export class Scene03 extends SceneBase {
         
         // グループで管理
         const group = new THREE.Group();
-        group.position.set(noiseX, 0, z);
+        group.position.set(noiseX, -height, z); // 初期位置を下に（アニメーション用）
         // グループの回転を明示的に0に設定（サークルの回転に影響しないように）
         group.rotation.set(0, 0, 0);
         
@@ -899,7 +918,8 @@ export class Scene03 extends SceneBase {
             
             // Track1のサークルエフェクトと同じ方法：グループで回転を管理（sceneに直接追加）
             const circleGroup = new THREE.Group();
-            circleGroup.position.set(noiseX, circleY, z);
+            // 初期位置を下に設定（生えてくるアニメーション用）
+            circleGroup.position.set(noiseX, -height + circleY, z);
             circleGroup.userData.isCircleGroup = true; // サークルグループのマーク
             
             const circle = new THREE.Mesh(this.geometries.track1Circle, this.materials.track1Circle);
@@ -912,9 +932,6 @@ export class Scene03 extends SceneBase {
             const circleEdge = new THREE.Mesh(this.geometries.track1CircleEdge, this.materials.track1CircleEdge);
             circleEdge.scale.set(circleScale * scale, circleScale * scale, 1);
             circleGroup.add(circleEdge);
-            
-            // 初期位置を下に設定（生えてくるアニメーション用）
-            circleGroup.position.y = -height + circleY;
             
             this.scene.add(circleGroup);
             // アニメーション用のデータを追加
@@ -932,7 +949,7 @@ export class Scene03 extends SceneBase {
         
         // 水平なCircleエフェクト（Scene01を参考、道に対して水平に並行）
         const circleEffectGroup = new THREE.Group();
-        circleEffectGroup.position.set(noiseX, 0, z);
+        circleEffectGroup.position.set(noiseX, -height, z); // 初期位置を下に（アニメーション用）
         circleEffectGroup.rotation.x = -Math.PI / 2; // 水平にする
         circleEffectGroup.visible = true;
         
@@ -948,10 +965,6 @@ export class Scene03 extends SceneBase {
         const spawnTime = performance.now();
         const duration = durationMs > 0 ? durationMs : 500; // デフォルト500ms
         const effectDuration = durationMs > 0 ? durationMs : 400; // Circleエフェクトの持続時間
-        
-        // 初期位置を下に設定（生えてくるアニメーション用）
-        group.position.y = -height;
-        circleEffectGroup.position.y = -height;
         
         this.scene.add(group);
         this.scene.add(circleEffectGroup);
@@ -976,8 +989,6 @@ export class Scene03 extends SceneBase {
             targetHeight: 0,
             baseRadius: 2.0 + v01 * 3.0 // ベース半径（velocityに応じて）
         });
-        
-        this._updateLookAtTarget(new THREE.Vector3(noiseX, height / 2, z));
     }
     
     // Track5: 細め円柱 + ランダムなCircle（位置・大きさランダム）
@@ -999,7 +1010,7 @@ export class Scene03 extends SceneBase {
         const scale = (baseScale + scaleVariation) * 1.3; // 大きく（1.3倍）
         
         const group = new THREE.Group();
-        group.position.set(noiseX, 0, z);
+        group.position.set(noiseX, -height, z); // 初期位置を下に（アニメーション用）
         // グループの回転を明示的に0に設定（サークルの回転に影響しないように）
         group.rotation.set(0, 0, 0);
         
@@ -1047,7 +1058,8 @@ export class Scene03 extends SceneBase {
             
             // Track1のサークルエフェクトと同じ方法：グループで回転を管理（sceneに直接追加）
             const circleGroup = new THREE.Group();
-            circleGroup.position.set(noiseX, circleY, z);
+            // 初期位置を下に設定（生えてくるアニメーション用）
+            circleGroup.position.set(noiseX, -height + circleY, z);
             circleGroup.userData.isCircleGroup = true; // サークルグループのマーク
             
             const circle = new THREE.Mesh(this.geometries.track5Circle, circleMaterial);
@@ -1056,13 +1068,11 @@ export class Scene03 extends SceneBase {
             circle.rotation.x = Math.PI; // 180度回転して水平にする
             circleGroup.add(circle);
             
-            // サークルのエッジ
+            // サークルのエッジ（水平にする）
             const circleEdge = new THREE.Mesh(this.geometries.track5CircleEdge, this.materials.track5CircleEdge);
             circleEdge.scale.set(circleScale * scale, circleScale * scale, 1);
+            circleEdge.rotation.x = Math.PI; // 180度回転して水平にする
             circleGroup.add(circleEdge);
-            
-            // 初期位置を下に設定（生えてくるアニメーション用）
-            circleGroup.position.y = -height + circleY;
             
             this.scene.add(circleGroup);
             // アニメーション用のデータを追加
@@ -1082,9 +1092,6 @@ export class Scene03 extends SceneBase {
         const spawnTime = performance.now();
         const duration = durationMs > 0 ? durationMs : 500;
         
-        // 初期位置を下に設定（生えてくるアニメーション用）
-        group.position.y = -height;
-        
         this.scene.add(group);
         this.track5Objects.push({ 
             mesh: group, 
@@ -1094,6 +1101,8 @@ export class Scene03 extends SceneBase {
             baseY: -height,
             targetHeight: 0
         });
+        
+        // Track5だけ注視点に設定
         this._updateLookAtTarget(new THREE.Vector3(noiseX, height, z));
     }
     
@@ -1139,26 +1148,30 @@ export class Scene03 extends SceneBase {
             baseY: -height,
             targetHeight: 0
         });
-        this._updateLookAtTarget(new THREE.Vector3(0, height / 2, z));
     }
     
-    // Track8: シルバーの薄い金属片（X位置と角度を蛇のように）
+    // Track8: シルバーの曲面金属片（X位置と角度、高さを蛇のように）
     _spawnTrack8Object(z, velocity = 100, durationMs = 0) {
         const v01 = velocity / 127;
         
-        // X位置をノイズで蛇のように（道の幅いっぱいに）
+        // X位置をノイズで蛇のように（Track5と同じ周期）
         const noiseOffsetX = (this._noise(z * 0.008 + 2000) - 0.5) * 4.0;
         this.lastTrack8X += noiseOffsetX;
         this.lastTrack8X = Math.max(-this.roadWidth * 0.48, Math.min(this.roadWidth * 0.48, this.lastTrack8X));
         const noiseX = this.lastTrack8X;
         
-        // 角度をノイズで蛇のように
-        const noiseOffsetRotX = (this._noise(z * 0.01 + 2100) - 0.5) * 0.5;
-        const noiseOffsetRotY = (this._noise(z * 0.01 + 2200) - 0.5) * 0.5;
-        const noiseOffsetRotZ = (this._noise(z * 0.01 + 2300) - 0.5) * 0.5;
+        // 角度をノイズで蛇のように（極めてゆっくり変化）
+        const noiseOffsetRotX = (this._noise(z * 0.001 + 2100) - 0.5) * 0.3;
+        const noiseOffsetRotY = (this._noise(z * 0.001 + 2200) - 0.5) * 0.3;
+        const noiseOffsetRotZ = (this._noise(z * 0.001 + 2300) - 0.5) * 0.3;
         this.lastTrack8RotX += noiseOffsetRotX;
         this.lastTrack8RotY += noiseOffsetRotY;
         this.lastTrack8RotZ += noiseOffsetRotZ;
+        
+        // 高さをランダムに（Track5と同じ）
+        const baseHeight = 0.5 + v01 * 1.5;
+        const heightVariation = (this._noise(z * 0.3) - 0.5) * 1.0;
+        const height = baseHeight + heightVariation;
         
         const scale = 0.8 + v01 * 0.6;
         
@@ -1181,7 +1194,7 @@ export class Scene03 extends SceneBase {
         const duration = durationMs > 0 ? durationMs : 500;
         
         // 初期位置を下に設定（生えてくるアニメーション用）
-        group.position.y = -2;
+        group.position.y = -height;
         
         this.scene.add(group);
         this.track8Objects.push({ 
@@ -1189,29 +1202,33 @@ export class Scene03 extends SceneBase {
             z,
             spawnTime,
             duration,
-            baseY: -2,
-            targetHeight: 1
+            baseY: -height,
+            targetHeight: height * 0.5
         });
-        this._updateLookAtTarget(new THREE.Vector3(noiseX, 1, z));
     }
     
-    // Track9: 黒の薄い金属片（X位置と角度を蛇のように）
+    // Track9: 黒の曲面金属片（X位置と角度、高さを蛇のように）
     _spawnTrack9Object(z, velocity = 100, durationMs = 0) {
         const v01 = velocity / 127;
         
-        // X位置をノイズで蛇のように（道の幅いっぱいに）
+        // X位置をノイズで蛇のように（Track5と同じ周期）
         const noiseOffsetX = (this._noise(z * 0.008 + 3000) - 0.5) * 4.0;
         this.lastTrack9X += noiseOffsetX;
         this.lastTrack9X = Math.max(-this.roadWidth * 0.48, Math.min(this.roadWidth * 0.48, this.lastTrack9X));
         const noiseX = this.lastTrack9X;
         
-        // 角度をノイズで蛇のように
-        const noiseOffsetRotX = (this._noise(z * 0.01 + 3100) - 0.5) * 0.5;
-        const noiseOffsetRotY = (this._noise(z * 0.01 + 3200) - 0.5) * 0.5;
-        const noiseOffsetRotZ = (this._noise(z * 0.01 + 3300) - 0.5) * 0.5;
+        // 角度をノイズで蛇のように（極めてゆっくり変化）
+        const noiseOffsetRotX = (this._noise(z * 0.001 + 3100) - 0.5) * 0.3;
+        const noiseOffsetRotY = (this._noise(z * 0.001 + 3200) - 0.5) * 0.3;
+        const noiseOffsetRotZ = (this._noise(z * 0.001 + 3300) - 0.5) * 0.3;
         this.lastTrack9RotX += noiseOffsetRotX;
         this.lastTrack9RotY += noiseOffsetRotY;
         this.lastTrack9RotZ += noiseOffsetRotZ;
+        
+        // 高さをランダムに（Track5と同じ）
+        const baseHeight = 0.5 + v01 * 1.5;
+        const heightVariation = (this._noise(z * 0.3 + 100) - 0.5) * 1.0;
+        const height = baseHeight + heightVariation;
         
         const scale = 0.8 + v01 * 0.6;
         
@@ -1234,7 +1251,7 @@ export class Scene03 extends SceneBase {
         const duration = durationMs > 0 ? durationMs : 500;
         
         // 初期位置を下に設定（生えてくるアニメーション用）
-        group.position.y = -2;
+        group.position.y = -height;
         
         this.scene.add(group);
         this.track9Objects.push({ 
@@ -1242,29 +1259,33 @@ export class Scene03 extends SceneBase {
             z,
             spawnTime,
             duration,
-            baseY: -2,
-            targetHeight: 1
+            baseY: -height,
+            targetHeight: height * 0.5
         });
-        this._updateLookAtTarget(new THREE.Vector3(noiseX, 1, z));
     }
     
-    // Track10: グレーの薄い金属片（X位置と角度を蛇のように）
+    // Track10: グレーの曲面金属片（X位置と角度、高さを蛇のように）
     _spawnTrack10Object(z, velocity = 100, durationMs = 0) {
         const v01 = velocity / 127;
         
-        // X位置をノイズで蛇のように（道の幅いっぱいに）
+        // X位置をノイズで蛇のように（Track5と同じ周期）
         const noiseOffsetX = (this._noise(z * 0.008 + 4000) - 0.5) * 4.0;
         this.lastTrack10X += noiseOffsetX;
         this.lastTrack10X = Math.max(-this.roadWidth * 0.48, Math.min(this.roadWidth * 0.48, this.lastTrack10X));
         const noiseX = this.lastTrack10X;
         
-        // 角度をノイズで蛇のように
-        const noiseOffsetRotX = (this._noise(z * 0.01 + 4100) - 0.5) * 0.5;
-        const noiseOffsetRotY = (this._noise(z * 0.01 + 4200) - 0.5) * 0.5;
-        const noiseOffsetRotZ = (this._noise(z * 0.01 + 4300) - 0.5) * 0.5;
+        // 角度をノイズで蛇のように（極めてゆっくり変化）
+        const noiseOffsetRotX = (this._noise(z * 0.001 + 4100) - 0.5) * 0.3;
+        const noiseOffsetRotY = (this._noise(z * 0.001 + 4200) - 0.5) * 0.3;
+        const noiseOffsetRotZ = (this._noise(z * 0.001 + 4300) - 0.5) * 0.3;
         this.lastTrack10RotX += noiseOffsetRotX;
         this.lastTrack10RotY += noiseOffsetRotY;
         this.lastTrack10RotZ += noiseOffsetRotZ;
+        
+        // 高さをランダムに（Track5と同じ）
+        const baseHeight = 0.5 + v01 * 1.5;
+        const heightVariation = (this._noise(z * 0.3 + 200) - 0.5) * 1.0;
+        const height = baseHeight + heightVariation;
         
         const scale = 0.8 + v01 * 0.6;
         
@@ -1287,7 +1308,7 @@ export class Scene03 extends SceneBase {
         const duration = durationMs > 0 ? durationMs : 500;
         
         // 初期位置を下に設定（生えてくるアニメーション用）
-        group.position.y = -2;
+        group.position.y = -height;
         
         this.scene.add(group);
         this.track10Objects.push({ 
@@ -1295,10 +1316,9 @@ export class Scene03 extends SceneBase {
             z,
             spawnTime,
             duration,
-            baseY: -2,
-            targetHeight: 1
+            baseY: -height,
+            targetHeight: height * 0.5
         });
-        this._updateLookAtTarget(new THREE.Vector3(noiseX, 1, z));
     }
     
     // モノリス生成
@@ -1330,7 +1350,6 @@ export class Scene03 extends SceneBase {
             baseY: -4,
             targetHeight: 4
         });
-        this._updateLookAtTarget(new THREE.Vector3(0, 4, z));
     }
     
     // 注視点を更新
@@ -1353,8 +1372,12 @@ export class Scene03 extends SceneBase {
             if (this.cameraMode === 'follow') {
                 this.cameraParticle.position.z = cameraZ - 15;
             } else {
-                this.cameraParticle.position.z = cameraZ + 10;
+                // leadモード：もっと前方に離す
+                this.cameraParticle.position.z = cameraZ + 25;
             }
+            
+            // Y座標の制限（高さを制限）
+            this.cameraParticle.position.y = Math.max(-5, Math.min(30, this.cameraParticle.position.y));
             
             // カメラ位置をパーティクル位置に同期
             this.camera.position.copy(this.cameraParticle.position);
@@ -1366,22 +1389,22 @@ export class Scene03 extends SceneBase {
             if (this.lookAtGoal.z < cameraZ - 50 || this.lookAtGoal.z > cameraZ + 100) {
                 this.lookAtGoal.copy(defaultLookAt);
             }
-            const lerpFactor = 0.1;
+            const lerpFactor = 0.03; // 0.1 → 0.03 に変更（より滑らかに）
             this.lookAtTarget.lerp(this.lookAtGoal, lerpFactor);
             if (this.lookAtTarget.z < cameraZ) {
                 this.lookAtTarget.z = cameraZ + 10;
             }
         } else {
-            // leadモード：前方にいて、後方（カメラより手前）を見る
-            const defaultLookAt = new THREE.Vector3(0, 1, cameraZ - 5);
+            // leadモード：もっと前方にいて、後方（カメラより手前）を見る
+            const defaultLookAt = new THREE.Vector3(0, 1, cameraZ - 10);
             if (this.lookAtGoal.z < cameraZ - 50 || this.lookAtGoal.z > cameraZ + 50) {
                 this.lookAtGoal.copy(defaultLookAt);
             }
-            const lerpFactor = 0.1;
+            const lerpFactor = 0.03; // 0.1 → 0.03 に変更（より滑らかに）
             this.lookAtTarget.lerp(this.lookAtGoal, lerpFactor);
             // leadモードでは後方を見るので、lookAtTarget.z < cameraZが正常
-            if (this.lookAtTarget.z > cameraZ - 3) {
-                this.lookAtTarget.z = cameraZ - 5;
+            if (this.lookAtTarget.z > cameraZ - 5) {
+                this.lookAtTarget.z = cameraZ - 10;
             }
         }
         
@@ -1564,10 +1587,12 @@ export class Scene03 extends SceneBase {
         // カメラの移動速度を速く（0.05 → 0.15、連打で重ならない程度）
         this.roadProgress = loopedTick * 0.15;
         
-        // phaseでカメラモード切替
+        // phaseでカメラモード切替とランダマイズ
         if (this.phase !== this.lastPhase) {
             this.lastPhase = this.phase;
             this.cameraMode = Math.random() > 0.5 ? 'follow' : 'lead';
+            // モード切替時にカメラをランダマイズ
+            this.applyCameraRandomize();
         }
         
         // 小節でモノリス生成
@@ -1575,7 +1600,7 @@ export class Scene03 extends SceneBase {
         if (currentBar !== this.lastBar) {
             this.lastBar = currentBar;
             // カメラより少し奥が最新のシーケンス位置になるように
-            const spawnZ = this.roadProgress + (this.cameraMode === 'follow' ? 30 : 15);
+            const spawnZ = this.roadProgress + (this.cameraMode === 'follow' ? 30 : 40);
             this._spawnMonolith(spawnZ, 0); // モノリスはデュレーションなし
         }
         
@@ -1638,7 +1663,12 @@ export class Scene03 extends SceneBase {
             this.actualTick = Number(args[0] ?? 0);
             // roadProgressはupdate()で計算するので、ここでは更新しない
         } else if (address === '/actual_bar') {
-            this.actualBar = Number(args[0] ?? 0);
+            const newBar = Number(args[0] ?? 0);
+            // 小節が変わったらカメラをランダマイズ
+            if (newBar !== this.actualBar) {
+                this.actualBar = newBar;
+                this.applyCameraRandomize();
+            }
         } else if (address === '/phase') {
             this.phase = Number(args[0] ?? 0);
         }
@@ -1654,10 +1684,9 @@ export class Scene03 extends SceneBase {
         const durationMs = Number(args[2] ?? 0);
         
         // カメラより少し奥が最新のシーケンス位置になるように
-        const spawnZ = this.roadProgress + (this.cameraMode === 'follow' ? 30 : 15);
+        const spawnZ = this.roadProgress + (this.cameraMode === 'follow' ? 30 : 40);
         
         if (trackNumber === 1) {
-            this.applyTrack1Camera(velocity, durationMs);
             this._spawnTrack1Object(spawnZ, velocity, durationMs);
         } else if (trackNumber === 2) {
             this.applyTrack2Invert(velocity, durationMs);
@@ -1678,14 +1707,13 @@ export class Scene03 extends SceneBase {
         }
     }
     
-    // Track1: カメラランダマイズ（カメラパーティクルに力を加える）
-    applyTrack1Camera(velocity, durationMs) {
-        if (!this.trackEffects[1] || !this.cameraParticle) return;
+    // カメラランダマイズ（actual_barトリガー、カメラパーティクルに力を加える）
+    applyCameraRandomize() {
+        if (!this.cameraParticle) return;
         
-        const v01 = Math.min(Math.max(velocity / 127, 0), 1);
-        // X位置とY位置にランダムな力を加える
-        const forceX = (Math.random() - 0.5) * 30 * v01; // X方向の力
-        const forceY = (Math.random() * 40 - 10) * v01; // Y方向の力（上方向に偏らせる）
+        // X位置とY位置にランダムな力を加える（極めて弱く）
+        const forceX = (Math.random() - 0.5) * 3; // X方向の力（極めて弱く）
+        const forceY = (Math.random() * 2 - 0.5); // Y方向の力（極めて弱く）
         
         const force = new THREE.Vector3(forceX, forceY, 0);
         this.cameraParticle.addForce(force);
