@@ -269,8 +269,11 @@ export class Scene01 extends SceneBase {
         this.overlayScene.add(boxWireframe);
         this.boundaryBox = boxWireframe;
         
-        // ポストFX（共通）
+        // ポストFX（共通、bloomを無効化）
+        const originalBloom = conf.bloom;
+        conf.bloom = false;
         this.initPostFX();
+        conf.bloom = originalBloom; // 他のシーンに影響しないように戻す
         
         // カメラパーティクルの可視化（c/C）を共通化：SceneBase側で描画
         // NOTE: Scene01はoverlaySceneに載せる（FX対象外）

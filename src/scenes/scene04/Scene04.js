@@ -6,6 +6,25 @@
 import { SceneTemplate } from '../SceneTemplate.js';
 import * as THREE from "three/webgpu";
 import { GridRuler3D } from '../../lib/GridRuler3D.js';
+import {
+    Fn,
+    float,
+    vec3,
+    sin,
+    cos,
+    abs,
+    max,
+    min,
+    pow,
+    sqrt,
+    mix,
+    step,
+    Loop,
+    If,
+    attribute,
+    uniform,
+    time
+} from 'three/tsl';
 
 export class Scene04 extends SceneTemplate {
     constructor(renderer, camera, sharedResourceManager = null) {
@@ -18,14 +37,25 @@ export class Scene04 extends SceneTemplate {
             2: true,   // invert
             3: true,   // chroma
             4: true,   // glitch
-            5: false,
+            5: true,   // ノイズアニメーション
             6: false,
             7: false,
             8: false,
             9: false,
         };
+        
+        // ノイズアニメーション用の時間（GPUシェーダーで使用）
+        this.noiseTime = 0;
+        this.terrainNoiseTimeUniform = null;
 
         this.terrainMesh = null;
+        
+        // クレーター管理（トラック5用）
+        this.craters = []; // { x, z, radius, depth, age, maxAge }
+        this.maxCraters = 10;
+        this.craterUniforms = null; // GPUシェーダー用のuniform配列
+        this.lastCraterSpawnTime = 0;
+        this.craterSpawnInterval = 2000; // 2秒ごとにクレーターを追加
         
         // カメラパーティクル（Track1用）
         this.cameraParticles = [];
@@ -39,6 +69,10 @@ export class Scene04 extends SceneTemplate {
 
     async setup() {
         await super.setup();
+        
+        // スクリーンショットテキストを非表示にする（中央のテキストを消す）
+        this.showScreenshotText = false;
+        this.screenshotText = '';
 
         // シーン固有のシャドウ設定（conf.jsに依存せず、シーンごとに独立）
         // Scene04: シャドウ無効（Terrainが大きすぎてパフォーマンスに影響するため）
@@ -195,92 +229,210 @@ export class Scene04 extends SceneTemplate {
     }
 
     _createTerrain() {
-        // シンプルな大きなPlaneを作成（CPU頂点計算方式）
-        // NOTE: TSL/positionNodeを使うと他シーンに影響するため、CPU側で計算
+        // 本物の山脈のような地形を作成（CPU頂点計算方式）
         const terrainWidth = 2000;
         const terrainDepth = 2000;
-        const terrainSegments = 500; // CPUで計算するので少し減らす
+        const terrainSegments = 500;
 
         const terrainGeom = new THREE.PlaneGeometry(terrainWidth, terrainDepth, terrainSegments, terrainSegments);
         terrainGeom.rotateX(-Math.PI / 2);
 
-        // CPU側で頂点位置を計算
         const positions = terrainGeom.attributes.position;
         const vertexCount = positions.count;
         const groundY = -0.02;
+
+        // Ridged Noise関数（尾根を作る）
+        const ridgedNoise = (val) => 1.0 - Math.abs(val);
+        
+        // FBM（Fractal Brownian Motion）的なノイズ生成
+        const fbmNoise = (x, z, octaves, persistence, lacunarity) => {
+            let total = 0;
+            let amplitude = 1;
+            let frequency = 1;
+            let maxValue = 0;
+            
+            for (let i = 0; i < octaves; i++) {
+                const nx = x * frequency;
+                const nz = z * frequency;
+                // 複数のsin/cosを組み合わせてノイズっぽく
+                const n = Math.sin(nx * 0.01) * Math.cos(nz * 0.01) +
+                          Math.sin(nx * 0.017 + nz * 0.013) * 0.5 +
+                          Math.cos(nz * 0.019 - nx * 0.011) * 0.25;
+                total += n * amplitude;
+                maxValue += amplitude;
+                amplitude *= persistence;
+                frequency *= lacunarity;
+            }
+            return total / maxValue;
+        };
 
         for (let i = 0; i < vertexCount; i++) {
             const x = positions.getX(i);
             const z = positions.getZ(i);
 
-            // エリアマスク
-            let highLowMask = (Math.sin(x * 0.0008) * Math.cos(z * 0.0007) + 1.0) * 0.5;
-            highLowMask *= (Math.sin(x * 0.0009 + z * 0.0008) * Math.cos(z * 0.00085 - x * 0.00075) + 1.0) * 0.5;
-            highLowMask *= (Math.sin(z * 0.00075) * Math.cos(x * 0.00085) + 1.0) * 0.5;
-            highLowMask *= (Math.sin(x * 0.0012 + z * 0.001) * Math.cos(z * 0.0011 - x * 0.0009) + 1.0) * 0.5;
-
-            // エリアタイプ
-            let areaType;
-            if (highLowMask < 0.25) {
-                areaType = Math.pow(highLowMask / 0.25, 3.0) * 0.1;
-            } else if (highLowMask < 0.75) {
-                areaType = Math.pow((highLowMask - 0.25) / 0.5, 3.0) * 0.8 + 0.1;
-            } else {
-                areaType = Math.pow((highLowMask - 0.75) / 0.25, 3.0) * 0.1 + 0.9;
+            // ===== 1. 大きな山脈の骨格（Ridged Noise）=====
+            // 斜め方向に伸びる尾根を複数作る
+            const ridgeAngle1 = 0.7; // 約40度
+            const ridgeAngle2 = -0.5; // 約-27度
+            const ridge1 = ridgedNoise(Math.sin((x * ridgeAngle1 + z) * 0.003)) * 80;
+            const ridge2 = ridgedNoise(Math.sin((x * ridgeAngle2 + z * 1.2) * 0.004)) * 60;
+            const ridge3 = ridgedNoise(Math.sin((x + z * ridgeAngle1) * 0.0025)) * 50;
+            
+            // 尾根を組み合わせ（乗算で交差点を強調）
+            const ridgeCombined = (ridge1 + ridge2 * 0.7 + ridge3 * 0.5);
+            
+            // ===== 2. 中規模の起伏（FBM）=====
+            const fbm = fbmNoise(x, z, 4, 0.5, 2.0) * 40;
+            
+            // ===== 3. 山頂を尖らせる（もっと尖らせる）=====
+            const rawHeight = ridgeCombined + fbm;
+            const normalizedHeight = (rawHeight + 100) / 200; // 0-1に正規化
+            const sharpenedHeight = Math.pow(Math.max(0, normalizedHeight), 2.5) * 200 - 50; // 1.8 → 2.5（より尖らせる）
+            
+            // ===== 4. 谷と平地を作る（低い部分を平らに）=====
+            const valleyThreshold = -20;
+            let height = sharpenedHeight;
+            if (height < valleyThreshold) {
+                // 谷は緩やかに
+                height = valleyThreshold + (height - valleyThreshold) * 0.3;
             }
+            
+            // ===== 5. 細かいディテール（高周波ノイズ）=====
+            const detail1 = Math.sin(x * 0.08) * Math.cos(z * 0.09) * 5;
+            const detail2 = Math.sin(x * 0.12 + z * 0.1) * Math.cos(z * 0.11 - x * 0.09) * 3;
+            const detail3 = Math.sin(x * 0.15 - z * 0.14) * 2;
+            const detailNoise = detail1 + detail2 + detail3;
+            
+            // 高い場所ほどディテールを強く
+            const detailScale = Math.max(0, (height + 50) / 150) * 0.8 + 0.2;
+            height += detailNoise * detailScale;
+            
+            // ===== 6. エリアごとの高低差（塊を作る）=====
+            const areaX = Math.sin(x * 0.0015) * Math.cos(z * 0.0012);
+            const areaZ = Math.sin(z * 0.0018) * Math.cos(x * 0.0014);
+            const areaMask = (areaX + areaZ + 2) / 4; // 0-1
+            const areaBoost = Math.pow(areaMask, 2) * 80 - 30;
+            height += areaBoost;
+            
+            // ===== 7. 端を低くする（島っぽく）=====
+            const distFromCenter = Math.sqrt(x * x + z * z);
+            const edgeFalloff = Math.max(0, 1 - distFromCenter / 900);
+            const edgeFalloffSmooth = Math.pow(edgeFalloff, 1.5);
+            height = height * edgeFalloffSmooth - 30 * (1 - edgeFalloffSmooth);
 
-            // ノイズ
-            const ridge1 = Math.sin(x * 0.01) * Math.cos(z * 0.01) * 15.0;
-            const ridge2 = Math.sin(x * 0.015 + z * 0.012) * Math.cos(z * 0.014 - x * 0.011) * 13.0;
-            const ridge3 = Math.sin(x * 0.012 - z * 0.013) * Math.cos(z * 0.015 + x * 0.010) * 12.0;
-            const ridge4 = Math.sin(z * 0.01) * Math.cos(x * 0.01) * 14.0;
-            const largeNoise = ridge1 + ridge2 + ridge3 + ridge4;
-
-            const medium1 = Math.sin(x * 0.05) * Math.cos(z * 0.05) * 8.0;
-            const medium2 = Math.sin(x * 0.06 + z * 0.04) * Math.cos(z * 0.05 - x * 0.04) * 7.0;
-            const medium3 = Math.sin(x * 0.04 - z * 0.06) * Math.cos(z * 0.05 + x * 0.05) * 6.0;
-            const medium4 = Math.sin(z * 0.05) * Math.cos(x * 0.05) * 7.5;
-            const mediumNoise = medium1 + medium2 + medium3 + medium4;
-
-            const fine1 = Math.sin(x * 0.15) * Math.cos(z * 0.12) * 2.5;
-            const fine2 = Math.sin(x * 0.18 + z * 0.15) * Math.cos(z * 0.16 - x * 0.14) * 2.0;
-            const fine3 = Math.sin(x * 0.14 - z * 0.18) * Math.cos(z * 0.15 + x * 0.17) * 1.8;
-            const fineNoise = fine1 + fine2 + fine3;
-
-            const firstPass = largeNoise + mediumNoise * 0.5;
-            const fineNoiseNormalized = (fineNoise + 6.3) / 12.6;
-            const secondPass = firstPass * (fineNoiseNormalized * 0.8 + 0.6);
-
-            const extra1 = Math.sin(x * 0.03 + z * 0.025) * Math.cos(z * 0.028 - x * 0.022) * 10.0;
-            const extra2 = Math.sin(x * 0.025 - z * 0.03) * Math.cos(z * 0.022 + x * 0.028) * 9.0;
-            const extra3 = Math.sin(z * 0.03) * Math.cos(x * 0.025) * 8.5;
-            const combinedNoise = secondPass + (extra1 + extra2 + extra3) * 0.4;
-
-            const baseHeight = areaType * 400.0 - 150.0;
-            const areaNoiseScale = areaType * 1.3 + 0.2;
-            const areaNoise = combinedNoise * areaNoiseScale;
-            let noise = baseHeight + areaNoise;
-
-            // エリアタイプで強調
-            if (areaType < 0.2) {
-                noise = noise * 0.8 - 30.0;
-            } else if (areaType >= 0.8) {
-                noise = noise * 1.2 + 50.0;
-            }
-
-            positions.setY(i, groundY + noise);
+            positions.setY(i, groundY + height);
         }
 
         positions.needsUpdate = true;
         terrainGeom.computeVertexNormals();
 
-        // 普通のMeshStandardMaterial（TSLを使わない）
-        const terrainMat = new THREE.MeshStandardMaterial({
+        // TSLでGPUシェーダーを使用（ノイズをGPUで計算）
+        // MeshStandardNodeMaterialを使う必要がある（positionNodeを使うため）
+        const terrainMat = new THREE.MeshStandardNodeMaterial({
             color: 0x2a2a2a,
             roughness: 0.3,
             metalness: 0.8,
             side: THREE.DoubleSide,
         });
+        
+        // ノイズアニメーション用のuniform
+        const noiseTime = uniform(0.0);
+        this.terrainNoiseTimeUniform = noiseTime;
+        
+        // クレーター用のuniform（最大10個）
+        // 各クレーター: [x, z, radius, depth]
+        this.craterUniforms = [];
+        for (let i = 0; i < this.maxCraters; i++) {
+            this.craterUniforms.push(uniform(new THREE.Vector4(0, 0, 0, 0)));
+        }
+        
+        // 頂点シェーダーでノイズを計算（TSL構文を修正）
+        terrainMat.positionNode = Fn(() => {
+            const pos = attribute('position');
+            const x = pos.x;
+            const z = pos.z;
+            const t = noiseTime;
+            const groundY = float(-0.02);
+            
+            // FBMノイズ（時間を追加、Loopを使用）
+            const total = float(0).toVar();
+            const amplitude = float(1).toVar();
+            const frequency = float(1).toVar();
+            const maxValue = float(0).toVar();
+            
+            Loop({ start: 0, end: 4, type: 'int', condition: '<' }, () => {
+                const nx = x.mul(frequency);
+                const nz = z.mul(frequency);
+                const n = sin(nx.mul(0.01).add(t.mul(0.1))).mul(cos(nz.mul(0.01).add(t.mul(0.08))))
+                    .add(sin(nx.mul(0.017).add(nz.mul(0.013)).add(t.mul(0.12))).mul(0.5))
+                    .add(cos(nz.mul(0.019).sub(nx.mul(0.011)).add(t.mul(0.15))).mul(0.25));
+                total.addAssign(n.mul(amplitude));
+                maxValue.addAssign(amplitude);
+                amplitude.mulAssign(0.5); // persistence
+                frequency.mulAssign(2.0); // lacunarity
+            });
+            
+            // maxValueが0にならないように保護
+            const safeMaxValue = max(maxValue, float(0.0001));
+            const fbm = total.div(safeMaxValue).mul(40);
+            
+            // 1. 大きな山脈の骨格（Ridged Noise、時間を追加）
+            // Ridged Noise: 1.0 - abs(val)
+            const ridgeAngle1 = float(0.7);
+            const ridgeAngle2 = float(-0.5);
+            const ridge1Val = sin(x.mul(ridgeAngle1).add(z).mul(0.003).add(t.mul(0.05)));
+            const ridge1 = float(1.0).sub(abs(ridge1Val)).mul(80);
+            const ridge2Val = sin(x.mul(ridgeAngle2).add(z.mul(1.2)).mul(0.004).add(t.mul(0.06)));
+            const ridge2 = float(1.0).sub(abs(ridge2Val)).mul(60);
+            const ridge3Val = sin(x.add(z.mul(ridgeAngle1)).mul(0.0025).add(t.mul(0.04)));
+            const ridge3 = float(1.0).sub(abs(ridge3Val)).mul(50);
+            const ridgeCombined = ridge1.add(ridge2.mul(0.7)).add(ridge3.mul(0.5));
+            
+            // 2. 中規模の起伏（FBM、時間を追加）
+            const rawHeight = ridgeCombined.add(fbm);
+            const normalizedHeight = rawHeight.add(100).div(200);
+            const sharpenedHeight = pow(max(normalizedHeight, 0), 2.5).mul(200).sub(50);
+            
+            // 3. 山頂を尖らせる
+            // 4. 谷と平地を作る
+            const valleyThreshold = float(-20);
+            const height = sharpenedHeight.toVar();
+            // 条件分岐をstep関数で実装
+            const isAboveThreshold = step(valleyThreshold, height);
+            height.assign(mix(
+                valleyThreshold.add(height.sub(valleyThreshold).mul(0.3)),
+                height,
+                isAboveThreshold
+            ));
+            
+            // 5. 細かいディテール（高周波ノイズ、時間を追加）
+            const detail1 = sin(x.mul(0.08).add(t.mul(0.2))).mul(cos(z.mul(0.09).add(t.mul(0.18)))).mul(5);
+            const detail2 = sin(x.mul(0.12).add(z.mul(0.1)).add(t.mul(0.25))).mul(cos(z.mul(0.11).sub(x.mul(0.09)).add(t.mul(0.22)))).mul(3);
+            const detail3 = sin(x.mul(0.15).sub(z.mul(0.14)).add(t.mul(0.3))).mul(2);
+            const detailNoise = detail1.add(detail2).add(detail3);
+            const detailScale = max(height.add(50).div(150), 0).mul(0.8).add(0.2);
+            height.addAssign(detailNoise.mul(detailScale));
+            
+            // 6. エリアごとの高低差（時間を追加）
+            const areaX = sin(x.mul(0.0015).add(t.mul(0.02))).mul(cos(z.mul(0.0012).add(t.mul(0.015))));
+            const areaZ = sin(z.mul(0.0018).add(t.mul(0.025))).mul(cos(x.mul(0.0014).add(t.mul(0.02))));
+            const areaMask = areaX.add(areaZ).add(2).div(4);
+            const areaBoost = pow(areaMask, 2).mul(80).sub(30);
+            height.addAssign(areaBoost);
+            
+            // 7. 端を低くする（島っぽく）
+            const distFromCenter = sqrt(x.mul(x).add(z.mul(z)));
+            const edgeFalloff = max(float(1).sub(distFromCenter.div(900)), 0);
+            const edgeFalloffSmooth = pow(edgeFalloff, 1.5);
+            height.mulAssign(edgeFalloffSmooth);
+            height.subAssign(float(30).mul(float(1).sub(edgeFalloffSmooth)));
+            
+            // 8. クレーターの影響を計算（トラック5用）- 一旦無効化してデバッグ
+            // const craterEffect = float(0).toVar();
+            // ... クレーター処理は一旦コメントアウト
+            
+            return vec3(x, groundY.add(height), z);
+        })();
 
         this.terrainMesh = new THREE.Mesh(terrainGeom, terrainMat);
         this.terrainMesh.position.set(0, 0, 0);
@@ -289,11 +441,67 @@ export class Scene04 extends SceneTemplate {
         this.terrainMesh.frustumCulled = false;
         this.scene.add(this.terrainMesh);
 
-        console.log('Terrain created (CPU vertex calculation)');
+        console.log('Terrain created (GPU shader calculation)');
     }
+    
+    // CPU更新処理は削除（GPUシェーダーで計算するため不要）
 
     onUpdate(deltaTime) {
         super.onUpdate(deltaTime);
+        
+        // トラック5でノイズを動かす（GPUシェーダーで計算）
+        if (this.trackEffects[5] && this.terrainNoiseTimeUniform) {
+            this.noiseTime += deltaTime * 0.001; // 時間を更新
+            this.terrainNoiseTimeUniform.value = this.noiseTime;
+            
+            // クレーターの更新
+            const currentTime = Date.now();
+            
+            // 古いクレーターを削除（年齢がmaxAgeを超えたもの）
+            this.craters = this.craters.filter(crater => {
+                crater.age += deltaTime * 1000; // ミリ秒単位
+                return crater.age < crater.maxAge;
+            });
+            
+            // 新しいクレーターを追加（一定間隔で）
+            if (currentTime - this.lastCraterSpawnTime > this.craterSpawnInterval) {
+                if (this.craters.length < this.maxCraters) {
+                    // ランダムな位置にクレーターを追加
+                    const x = (Math.random() - 0.5) * 1800; // -900 ～ 900
+                    const z = (Math.random() - 0.5) * 1800; // -900 ～ 900
+                    const radius = 50 + Math.random() * 100; // 50 ～ 150
+                    const depth = 20 + Math.random() * 30; // 20 ～ 50
+                    const maxAge = 5000 + Math.random() * 5000; // 5秒 ～ 10秒
+                    
+                    this.craters.push({
+                        x, z, radius, depth,
+                        age: 0,
+                        maxAge: maxAge
+                    });
+                }
+                this.lastCraterSpawnTime = currentTime;
+            }
+            
+            // クレーターのuniformを更新
+            for (let i = 0; i < this.maxCraters; i++) {
+                if (i < this.craters.length) {
+                    const crater = this.craters[i];
+                    // 年齢に応じて深さを減らす（徐々に消える）
+                    const ageFactor = 1.0 - (crater.age / crater.maxAge);
+                    const currentDepth = crater.depth * Math.max(0, ageFactor);
+                    this.craterUniforms[i].value.set(crater.x, crater.z, crater.radius, currentDepth);
+                } else {
+                    // クレーターがない場合は無効化（半径0）
+                    this.craterUniforms[i].value.set(0, 0, 0, 0);
+                }
+            }
+        } else {
+            // トラック5がOFFの時はクレーターをクリア
+            this.craters = [];
+            for (let i = 0; i < this.maxCraters; i++) {
+                this.craterUniforms[i].value.set(0, 0, 0, 0);
+            }
+        }
         
         // グリッドの更新（カメラに追従）
         if (this.worldGrid) {
