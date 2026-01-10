@@ -436,10 +436,12 @@ export class SimpleParticleSystem {
             const pn = noise3(dir.mul(this.uniforms.pressureNoiseFreq).add(pDir.mul(7.13))).toConst('pN');
             const nMul = mix(float(1.0).sub(this.uniforms.pressureNoiseAmp), float(1.0).add(this.uniforms.pressureNoiseAmp), pn).toConst('pNMul');
 
-            // 速度へインパルス
+            // 速度へインパルス（負の値も許可：Track6で凹むため）
             const impulse = dome.mul(nMul).mul(this.uniforms.pressureStrength).toConst('pImpulse');
             const v0 = pr.get('offsetVel').toConst('v0');
-            const v1 = clamp(v0.add(impulse), float(0.0), this.uniforms.pressureVelMax).toConst('v1');
+            const vMax = this.uniforms.pressureVelMax.toConst('vMax');
+            const vMin = vMax.mul(float(-1.0)).toConst('vMin'); // 負の値も許可
+            const v1 = clamp(v0.add(impulse), vMin, vMax).toConst('v1');
             pr.get('offsetVel').assign(v1);
         })().compute(1);
 
@@ -462,19 +464,36 @@ export class SimpleParticleSystem {
             const dt = max(float(0.0), this.uniforms.deltaTime).toConst('dt');
             const damp = this.uniforms.pressureVelDamping.toConst('damp');
             const vD = v0.div(float(1.0).add(damp.mul(dt))).toConst('vD'); // 近似指数減衰
-            const off1 = clamp(off0.add(vD.mul(dt)), 0.0, this.uniforms.pressureOffsetMax).toConst('off1');
+            const offMax = this.uniforms.pressureOffsetMax.toConst('offMax');
+            const offMin = offMax.mul(float(-1.0)).toConst('offMin'); // 負の値も許可（Track6で凹むため）
+            const off1 = clamp(off0.add(vD.mul(dt)), offMin, offMax).toConst('off1');
             pr.get('offsetVel').assign(vD);
             pr.get('offset').assign(off1);
 
             const radius = this.uniforms.baseRadius.add(h).add(off1).toConst('radius');
             const position = dir.mul(radius).toConst('pos');
 
+            // ベースヒート（ノイズによる高さ変動）
             const heatBase = max(float(0.0), h01).mul(2.0).toConst('heatBase');
+            // 圧力によるヒート（offsetが大きいほど赤くなる、負の値（凹み）の時は黒に近づく）
             const heatPress = off1.mul(this.uniforms.pressureHeatGain).toConst('heatPress');
-            const heat = clamp(heatBase.add(heatPress), 0.0, 1.0).toConst('heat');
+            // 圧力によるヒートを強調（ベースヒートと圧力ヒートを加算合成）
+            // 正のoffset（膨らみ）の時は赤くなる、負のoffset（凹み）の時は黒に近づく
+            const heatRaw = heatBase.add(heatPress).toConst('heatRaw');
+            const heat = clamp(heatRaw, 0.0, 1.0).toConst('heat');
+            // 負のoffsetの時は、offsetの絶対値に比例してheatを減らして黒に近づける
+            // offsetが0に戻れば、heatも元の値に戻る
+            const isNegative = step(off1, float(0.0)).toConst('isNegative'); // off1 < 0 なら 1.0
+            const offAbs = abs(off1).toConst('offAbs'); // offsetの絶対値
+            // offMaxは既に467行目で宣言済み
+            const offRatio = clamp(offAbs.div(offMax), 0.0, 1.0).toConst('offRatio'); // 0..1（offsetの割合）
+            // 負のoffsetの時だけ、offsetの割合に比例してheatを減らす（最大80%減らす）
+            const heatReduction = isNegative.mul(offRatio).mul(0.8).toConst('heatReduction');
+            const heatFinal = heat.mul(float(1.0).sub(heatReduction)).toConst('heatFinal');
+            const heatClamped = clamp(heatFinal, 0.0, 1.0).toConst('heatClamped');
 
             particle.get('position').assign(position);
-            particle.get('heat').assign(heat);
+            particle.get('heat').assign(heatClamped);
         })().compute(1);
 
         // dispatch count を設定

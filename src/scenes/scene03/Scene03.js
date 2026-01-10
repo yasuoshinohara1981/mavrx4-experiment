@@ -244,45 +244,6 @@ export class Scene03 extends SceneBase {
             clearcoat: 0.9,
         });
         
-        // Track1: 円柱のエッジ（上下の円）
-        this.geometries.track1CylEdge = new THREE.RingGeometry(0.49, 0.5, 32);
-        this.materials.track1CylEdge = new THREE.MeshPhysicalMaterial({
-            color: 0x0a0a0a,
-            roughness: 0.15,
-            metalness: 1.0,
-            clearcoat: 0.8,
-            side: THREE.DoubleSide,
-        });
-        
-        // Track1: サークルのエッジ
-        this.geometries.track1CircleEdge = new THREE.RingGeometry(0.59, 0.6, 32);
-        this.materials.track1CircleEdge = new THREE.MeshPhysicalMaterial({
-            color: 0x0a0a0a,
-            roughness: 0.1,
-            metalness: 1.0,
-            clearcoat: 0.9,
-            side: THREE.DoubleSide,
-        });
-        
-        // Track1: 水平なCircleエフェクト（Scene01を参考）
-        const segments = 32;
-        this.geometries.track1RingFill = new THREE.RingGeometry(0.0, 1.0, segments);
-        this.materials.track1RingFill = new THREE.MeshBasicMaterial({
-            color: 0xffff00,
-            transparent: true,
-            opacity: 0.22,
-            side: THREE.DoubleSide,
-            depthWrite: false
-        });
-        this.geometries.track1RingEdge = new THREE.RingGeometry(0.985, 1.0, segments);
-        this.materials.track1RingEdge = new THREE.MeshBasicMaterial({
-            color: 0xffff00,
-            transparent: true,
-            opacity: 0.8,
-            side: THREE.DoubleSide,
-            depthWrite: false
-        });
-        
         // === Track5: 細め円柱（ピカピカな金属、もっと大きく） ===
         this.geometries.track5Cyl = new THREE.CylinderGeometry(0.35, 0.35, 1, 12);
         this.materials.track5Cyl = new THREE.MeshPhysicalMaterial({
@@ -293,15 +254,6 @@ export class Scene03 extends SceneBase {
         });
         
         // Track5: 円柱のエッジ（上下の円）
-        this.geometries.track5CylEdge = new THREE.RingGeometry(0.34, 0.35, 24);
-        this.materials.track5CylEdge = new THREE.MeshPhysicalMaterial({
-            color: 0x0a0a0a,
-            roughness: 0.1,
-            metalness: 1.0,
-            clearcoat: 0.9,
-            side: THREE.DoubleSide,
-        });
-        
         // Track5: 上のCircle（黒、大きく、厚みのある円盤で表現）
         this.geometries.track5Circle = new THREE.CylinderGeometry(0.35, 0.35, 0.05, 24);
         this.materials.track5Circle = new THREE.MeshPhysicalMaterial({
@@ -319,17 +271,6 @@ export class Scene03 extends SceneBase {
             clearcoat: 1.0,
         });
         
-        // Track5: サークルのエッジ（リング状）
-        const track5Segments = 32;
-        this.geometries.track5CircleEdge = new THREE.RingGeometry(0.34, 0.35, track5Segments);
-        this.materials.track5CircleEdge = new THREE.MeshPhysicalMaterial({
-            color: 0x0a0a0a,
-            roughness: 0.15,
-            metalness: 1.0,
-            clearcoat: 0.8,
-            side: THREE.DoubleSide,
-        });
-        
         // === Track6: 赤い細いシリンダー（小さく） ===
         this.geometries.track6 = new THREE.CylinderGeometry(0.025, 0.025, 1, 8);
         this.materials.track6 = new THREE.MeshPhysicalMaterial({
@@ -339,16 +280,6 @@ export class Scene03 extends SceneBase {
             clearcoat: 0.8,
             emissive: 0x440000,
             emissiveIntensity: 0.3,
-        });
-        
-        // Track6: シリンダーのエッジ（上下の円）
-        this.geometries.track6Edge = new THREE.RingGeometry(0.024, 0.025, 16);
-        this.materials.track6Edge = new THREE.MeshPhysicalMaterial({
-            color: 0x0a0a0a,
-            roughness: 0.1,
-            metalness: 1.0,
-            clearcoat: 0.9,
-            side: THREE.DoubleSide,
         });
         
         // === モノリス（ピカピカな金属、幅を太く） ===
@@ -380,11 +311,6 @@ export class Scene03 extends SceneBase {
             clearcoat: 1.0,
             side: THREE.DoubleSide,
         });
-        this.materials.track8Edge = new THREE.LineBasicMaterial({
-            color: 0x0a0a0a,
-            linewidth: 1,
-        });
-        
         // Track9: 黒 - シリンダーの120度部分を剥がした形（高さあり、小さめ）
         this.geometries.track9 = new THREE.CylinderGeometry(
             0.6, 0.6, 1.8, 32, 1, true, 0, Math.PI * 2 / 3 // 半径0.6, 高さ1.8, 120度
@@ -396,11 +322,6 @@ export class Scene03 extends SceneBase {
             clearcoat: 0.8,
             side: THREE.DoubleSide,
         });
-        this.materials.track9Edge = new THREE.LineBasicMaterial({
-            color: 0x0a0a0a,
-            linewidth: 1,
-        });
-        
         // Track10: グレー - シリンダーの180度部分を剥がした形（高さあり、小さめ）
         this.geometries.track10 = new THREE.CylinderGeometry(
             1.0, 1.0, 1.2, 32, 1, true, 0, Math.PI // 半径1.0, 高さ1.2, 180度
@@ -411,10 +332,6 @@ export class Scene03 extends SceneBase {
             metalness: 1.0,
             clearcoat: 0.9,
             side: THREE.DoubleSide,
-        });
-        this.materials.track10Edge = new THREE.LineBasicMaterial({
-            color: 0x0a0a0a,
-            linewidth: 1,
         });
     }
     
@@ -902,19 +819,6 @@ export class Scene03 extends SceneBase {
         cyl.castShadow = true;
         group.add(cyl);
         
-        // 円柱のエッジ（上下の円）
-        const cylEdgeTop = new THREE.Mesh(this.geometries.track1CylEdge, this.materials.track1CylEdge);
-        cylEdgeTop.scale.set(scale, scale, 1);
-        cylEdgeTop.position.y = height;
-        cylEdgeTop.rotation.x = -Math.PI / 2;
-        group.add(cylEdgeTop);
-        
-        const cylEdgeBottom = new THREE.Mesh(this.geometries.track1CylEdge, this.materials.track1CylEdge);
-        cylEdgeBottom.scale.set(scale, scale, 1);
-        cylEdgeBottom.position.y = 0;
-        cylEdgeBottom.rotation.x = -Math.PI / 2;
-        group.add(cylEdgeBottom);
-        
         // ランダムなCircle（1〜4個、一番上には来ない）
         const circleCount = 1 + Math.floor(this._noise(z * 0.2) * 4);
         for (let i = 0; i < circleCount; i++) {
@@ -935,9 +839,6 @@ export class Scene03 extends SceneBase {
             circleGroup.add(circle);
             
             // サークルのエッジ
-            const circleEdge = new THREE.Mesh(this.geometries.track1CircleEdge, this.materials.track1CircleEdge);
-            circleEdge.scale.set(circleScale * scale, circleScale * scale, 1);
-            circleGroup.add(circleEdge);
             
             this.scene.add(circleGroup);
             // アニメーション用のデータを追加
@@ -953,47 +854,15 @@ export class Scene03 extends SceneBase {
             });
         }
         
-        // 水平なCircleエフェクト（Scene01を参考、道に対して水平に並行）
-        const circleEffectGroup = new THREE.Group();
-        circleEffectGroup.position.set(noiseX, -height, z); // 初期位置を下に（アニメーション用）
-        circleEffectGroup.rotation.x = -Math.PI / 2; // 水平にする
-        circleEffectGroup.visible = true;
-        
-        const ringFill = new THREE.Mesh(this.geometries.track1RingFill, this.materials.track1RingFill.clone());
-        ringFill.scale.set(0, 0, 1); // 初期スケールを0に（広がるアニメーション用）
-        circleEffectGroup.add(ringFill);
-        
-        const ringEdge = new THREE.Mesh(this.geometries.track1RingEdge, this.materials.track1RingEdge.clone());
-        ringEdge.scale.set(0, 0, 1); // 初期スケールを0に（広がるアニメーション用）
-        circleEffectGroup.add(ringEdge);
-        
-        // アニメーション用のデータを追加
-        const spawnTime = performance.now();
-        const duration = durationMs > 0 ? durationMs : 500; // デフォルト500ms
-        const effectDuration = durationMs > 0 ? durationMs : 400; // Circleエフェクトの持続時間
-        
         this.scene.add(group);
-        this.scene.add(circleEffectGroup);
         
         this.track1Objects.push({ 
             mesh: group, 
             z,
-            spawnTime,
-            duration,
+            spawnTime: performance.now(),
+            duration: durationMs > 0 ? durationMs : 500,
             baseY: -height,
             targetHeight: -0.5  // 道の上（-0.5）に配置
-        });
-        
-        this.track1CircleEffects.push({
-            group: circleEffectGroup,
-            ringFill,
-            ringEdge,
-            z,
-            spawnTime,
-            duration: effectDuration,
-            baseY: -height,
-            targetHeight: 0,
-            baseRadius: 2.0 + v01 * 3.0 // ベース半径（velocityに応じて）
         });
     }
     
@@ -1026,19 +895,6 @@ export class Scene03 extends SceneBase {
         cyl.position.y = height / 2;
         cyl.castShadow = true;
         group.add(cyl);
-        
-        // 円柱のエッジ（上下の円）
-        const cylEdgeTop = new THREE.Mesh(this.geometries.track5CylEdge, this.materials.track5CylEdge);
-        cylEdgeTop.scale.set(scale, scale, 1);
-        cylEdgeTop.position.y = height;
-        cylEdgeTop.rotation.x = -Math.PI / 2;
-        group.add(cylEdgeTop);
-        
-        const cylEdgeBottom = new THREE.Mesh(this.geometries.track5CylEdge, this.materials.track5CylEdge);
-        cylEdgeBottom.scale.set(scale, scale, 1);
-        cylEdgeBottom.position.y = 0;
-        cylEdgeBottom.rotation.x = -Math.PI / 2;
-        group.add(cylEdgeBottom);
         
         // ランダムなCircle（1枚は必ず円柱の一番上に、追加で0〜2個ランダム配置）
         const circleCount = 1 + Math.floor(this._noise(z * 0.2) * 3);
@@ -1077,10 +933,6 @@ export class Scene03 extends SceneBase {
             circleGroup.add(circle);
             
             // サークルのエッジ（水平にする）
-            const circleEdge = new THREE.Mesh(this.geometries.track5CircleEdge, this.materials.track5CircleEdge);
-            circleEdge.scale.set(circleScale * scale, circleScale * scale, 1);
-            circleEdge.rotation.x = Math.PI; // 180度回転して水平にする
-            circleGroup.add(circleEdge);
             
             this.scene.add(circleGroup);
             // アニメーション用のデータを追加
@@ -1126,19 +978,6 @@ export class Scene03 extends SceneBase {
         mesh.position.y = height / 2;
         mesh.castShadow = true;
         group.add(mesh);
-        
-        // シリンダーのエッジ（上下の円）
-        const edgeTop = new THREE.Mesh(this.geometries.track6Edge, this.materials.track6Edge);
-        edgeTop.scale.set(1, 1, 1);
-        edgeTop.position.y = height;
-        edgeTop.rotation.x = -Math.PI / 2;
-        group.add(edgeTop);
-        
-        const edgeBottom = new THREE.Mesh(this.geometries.track6Edge, this.materials.track6Edge);
-        edgeBottom.scale.set(1, 1, 1);
-        edgeBottom.position.y = 0;
-        edgeBottom.rotation.x = -Math.PI / 2;
-        group.add(edgeBottom);
         
         // アニメーション用のデータを追加
         const spawnTime = performance.now();
@@ -1193,11 +1032,6 @@ export class Scene03 extends SceneBase {
         group.add(mesh);
         
         // エッジ
-        const edgeGeometry = new THREE.EdgesGeometry(this.geometries.track8);
-        const edgeLines = new THREE.LineSegments(edgeGeometry, this.materials.track8Edge);
-        edgeLines.scale.set(scale, scale, scale);
-        group.add(edgeLines);
-        
         // アニメーション用のデータを追加
         const spawnTime = performance.now();
         const duration = durationMs > 0 ? durationMs : 500;
@@ -1254,11 +1088,6 @@ export class Scene03 extends SceneBase {
         group.add(mesh);
         
         // エッジ
-        const edgeGeometry = new THREE.EdgesGeometry(this.geometries.track9);
-        const edgeLines = new THREE.LineSegments(edgeGeometry, this.materials.track9Edge);
-        edgeLines.scale.set(scale, scale, scale);
-        group.add(edgeLines);
-        
         // アニメーション用のデータを追加
         const spawnTime = performance.now();
         const duration = durationMs > 0 ? durationMs : 500;
@@ -1315,11 +1144,6 @@ export class Scene03 extends SceneBase {
         group.add(mesh);
         
         // エッジ
-        const edgeGeometry = new THREE.EdgesGeometry(this.geometries.track10);
-        const edgeLines = new THREE.LineSegments(edgeGeometry, this.materials.track10Edge);
-        edgeLines.scale.set(scale, scale, scale);
-        group.add(edgeLines);
-        
         // アニメーション用のデータを追加
         const spawnTime = performance.now();
         const duration = durationMs > 0 ? durationMs : 500;
@@ -1538,39 +1362,6 @@ export class Scene03 extends SceneBase {
         if (this.track1CircleGroups) updateCircleGroups(this.track1CircleGroups);
         if (this.track5CircleGroups) updateCircleGroups(this.track5CircleGroups);
         
-        
-        // Track1の水平Circleエフェクトのアニメーション（広がって段々と透明になって消える）
-        for (let i = 0; i < this.track1CircleEffects.length; i++) {
-            const effect = this.track1CircleEffects[i];
-            if (!effect.group || !effect.group.visible) continue;
-            
-            const elapsed = now - effect.spawnTime;
-            const progress = Math.min(elapsed / effect.duration, 1.0);
-            
-            // Y位置を下から上にアニメーション
-            const eased = 1 - Math.pow(1 - progress, 3);
-            const currentY = effect.baseY + (effect.targetHeight - effect.baseY) * eased;
-            effect.group.position.y = currentY;
-            
-            // 広がって段々と透明になって消えるアニメーション
-            // 半径は時間経過で拡大（0から広がる）
-            const radiusScale = progress; // 0倍から1倍まで拡大
-            const radius = effect.baseRadius * radiusScale;
-            
-            // 透明度は段々と透明になる（easeOutで滑らかに）
-            const alphaEased = 1 - Math.pow(progress, 2); // easeOutQuad
-            const alpha = Math.max(0, alphaEased);
-            
-            effect.ringFill.scale.set(radius, radius, 1);
-            effect.ringFill.material.opacity = alpha * 0.22;
-            effect.ringEdge.scale.set(radius, radius, 1);
-            effect.ringEdge.material.opacity = alpha * 0.8;
-            
-            // 終了したら非表示
-            if (progress >= 1.0) {
-                effect.group.visible = false;
-            }
-        }
     }
     
     // 古いオブジェクトを削除（見えなくなるまで消さない）
@@ -1592,17 +1383,6 @@ export class Scene03 extends SceneBase {
         };
         
         cleanup(this.track1Objects);
-        
-        // Track1のCircleエフェクトも削除
-        for (let i = this.track1CircleEffects.length - 1; i >= 0; i--) {
-            const effect = this.track1CircleEffects[i];
-            if (effect.z < cameraZ - cleanupDistance) {
-                if (effect.group) {
-                    this.scene.remove(effect.group);
-                }
-                this.track1CircleEffects.splice(i, 1);
-            }
-        }
         
         // Track1のサークルグループも削除
         if (this.track1CircleGroups) {

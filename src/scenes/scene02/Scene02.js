@@ -39,7 +39,7 @@ export class Scene02 extends SceneBase {
             3: true,   // chroma
             4: true,   // glitch
             5: true,   // シーン固有の処理
-            6: false,
+            6: true,  // Track6: 凹むように圧力を掛ける
             7: false,
             8: false,  // 触手エフェクト（削除）
             9: false,
@@ -684,7 +684,8 @@ export class Scene02 extends SceneBase {
         const durationMs = Number(args[2] ?? 0);
         
         if (trackNumber === 1) {
-            // Track1: エフェクトなし（削除）
+            // Track1: カメラランダマイズ（他のシーン同様）
+            this.switchCameraRandom();
         } else if (trackNumber === 2) {
             this.applyTrack2Invert(velocity, durationMs);
         } else if (trackNumber === 3) {
@@ -693,6 +694,8 @@ export class Scene02 extends SceneBase {
             this.applyTrack4Glitch(velocity, durationMs);
         } else if (trackNumber === 5) {
             this.applyTrack5Pressure(noteNumber, velocity, durationMs);
+        } else if (trackNumber === 6) {
+            this.applyTrack6Pressure(noteNumber, velocity, durationMs);
         }
     }
     
@@ -885,6 +888,52 @@ export class Scene02 extends SceneBase {
         this.particleSystem.applyPressure(dir, strength, angle);
         
         // Circleエフェクトとテキスト、赤いsphereを表示
+    }
+    
+    /**
+     * Track6: 凹むように圧力を掛ける（負の方向）
+     * - Track5とは逆に、外側から内側に向かって圧力を掛ける
+     * - 球体の表面からマイナス方向に押し込む
+     */
+    applyTrack6Pressure(noteNumber, velocity, durationMs) {
+        if (!this.trackEffects?.[6]) return;
+        if (!this.particleSystem) return;
+
+        // 圧力モードを有効化
+        if (!this.ENABLE_PRESSURE) {
+            this.ENABLE_PRESSURE = true;
+            if (this.particleSystem?.setPressureModeEnabled) {
+                this.particleSystem.setPressureModeEnabled(true);
+            }
+        }
+
+        const v01 = Math.min(Math.max((Number(velocity) || 0) / 127, 0), 1);
+
+        // ランダムな方向（球面上のランダムな点）を生成
+        const theta = Math.random() * Math.PI * 2; // 0..2π
+        const phi = Math.acos(2 * Math.random() - 1); // 0..π
+        const dir = new THREE.Vector3(
+            Math.sin(phi) * Math.cos(theta),
+            Math.sin(phi) * Math.sin(theta),
+            Math.cos(phi)
+        ).normalize();
+
+        // 外側から内側に向かう圧力なので、方向を反転
+        const inwardDir = dir.clone().multiplyScalar(-1);
+
+        // velocityで強さを変える
+        const strength = 0.02 + v01 * 0.10; // 0.02-0.12
+        const angle = 0.3 + v01 * 0.5; // 0.3-0.8 rad
+
+        // 圧力の上限をvelocityで変える（負の値も許可）
+        const velMax = 0.4 + v01 * 0.9; // 0.4-1.3
+        const offsetMax = 0.65; // 負の値も許可するため、正の上限を設定
+
+        this.particleSystem.setPressureTuning({ velMax, offsetMax });
+
+        // 永続圧力（負の方向に圧力を掛ける）
+        // NOTE: 外側から内側に向かう圧力なので、負の方向に
+        this.particleSystem.applyPressure(inwardDir, strength, angle);
         const baseR = Number(this.particleSystem?.uniforms?.baseRadius?.value ?? 1.1);
         const posWorld = dir.clone().multiplyScalar(baseR);
         this.triggerImpulseIndicator({
